@@ -67,10 +67,9 @@ class JobsView(BaseView):
         self.page = request.args.get('page', default=1, type=int)
 
         self.url = 'http://%s/jobs' % self.SCRAPYD_SERVER
-        if self.SCRAPYD_SERVER_PUBLIC_URL:
-            self.public_url = '%s/jobs' % self.SCRAPYD_SERVER_PUBLIC_URL
-        else:
-            self.public_url = ''
+        # Public (reverse proxy) base for the result links the browser follows to
+        # Scrapyd; equals self.url when no public url is configured for the node.
+        self.public_url = self.make_public_url(self.url)
         self.text = ''
         self.kwargs = {}
         if self.USE_MOBILEUI:
@@ -349,9 +348,9 @@ class JobsView(BaseView):
                 job.url_clusterreports = url_for('clusterreports', node=self.node, project=job.project,
                                                  spider=job.spider, job=job.job)
                 # '/items/demo/test/2018-10-12_205507.log'
-                job.url_source = urljoin(self.public_url or self.url, job.href_log)
+                job.url_source = urljoin(self.public_url, job.href_log)
                 if job.href_items:
-                    job.url_items = urljoin(self.public_url or self.url, job.href_items)
+                    job.url_items = urljoin(self.public_url, job.href_items)
                 else:
                     job.url_items = ''
                 job.url_delete = url_for('jobs.xhr', node=self.node, action='delete', id=job.id)
@@ -396,7 +395,7 @@ class JobsView(BaseView):
                 # <a href='/items/demo/test/2018-10-12_205507.jl'>Items</a>
                 m = re.search(HREF_PATTERN, job['href_items'])
                 if m:
-                    job['url_items'] = urljoin(self.public_url or self.url, m.group(1))
+                    job['url_items'] = urljoin(self.public_url, m.group(1))
                 else:
                     job['url_items'] = ''
 
@@ -409,10 +408,10 @@ class JobsView(BaseView):
     def set_kwargs(self):
         self.kwargs = dict(
             node=self.node,
-            url=self.url,
+            url=self.public_url,
             url_schedule=url_for('schedule', node=self.node),
             url_liststats=url_for('api', node=self.node, opt='liststats'),
-            url_liststats_source='http://%s/logs/stats.json' % self.SCRAPYD_SERVER,
+            url_liststats_source=self.make_public_url('http://%s/logs/stats.json' % self.SCRAPYD_SERVER),
             SCRAPYD_SERVER=self.SCRAPYD_SERVER.split(':')[0],
             LOGPARSER_VERSION=self.LOGPARSER_VERSION,
             JOBS_RELOAD_INTERVAL=self.JOBS_RELOAD_INTERVAL,

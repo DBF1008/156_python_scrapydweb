@@ -20,10 +20,9 @@ class ItemsView(BaseView):
         self.url = 'http://{}/items/{}{}'.format(self.SCRAPYD_SERVER,
                                                  '%s/' % self.project if self.project else '',
                                                  '%s/' % self.spider if self.spider else '')
-        if self.SCRAPYD_SERVER_PUBLIC_URL:
-            self.public_url = re.sub(r'^http.*?/items/', self.SCRAPYD_SERVER_PUBLIC_URL + '/items/', self.url)
-        else:
-            self.public_url = ''
+        # Public (reverse proxy) base for the file links and the directory link the
+        # browser follows to Scrapyd; equals self.url when no public url is configured.
+        self.public_url = self.make_public_url(self.url)
         self.template = 'scrapydweb/logs_items.html'
         self.text = ''
 
@@ -49,7 +48,7 @@ class ItemsView(BaseView):
             # <a href="a.jl">a.jl</a>       file
             row['href'], row['filename'] = re.search(HREF_NAME_PATTERN, row['filename']).groups()
             if not row['href'].endswith('/'):  # It's a file but not a directory
-                row['href'] = (self.public_url or self.url) + row['href']
+                row['href'] = self.public_url + row['href']
 
             if self.project and self.spider:
                 if row['filename'].endswith('.tar.gz'):
@@ -74,7 +73,7 @@ class ItemsView(BaseView):
             title='items',
             project=self.project,
             spider=self.spider,
-            url=self.url,
+            url=self.public_url,
             url_schedule=url_schedule,
             url_multinode_run=url_multinode_run,
             rows=rows

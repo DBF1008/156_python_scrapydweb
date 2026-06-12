@@ -11,7 +11,7 @@ from six import text_type
 
 from ..__version__ import __version__ as SCRAPYDWEB_VERSION
 from ..common import (get_now_string, get_response_from_view, handle_metadata,
-                      handle_slash, json_dumps, session)
+                      handle_public_url, handle_slash, json_dumps, session)
 from ..vars import (ALLOWED_SCRAPYD_LOG_EXTENSIONS, APSCHEDULER_DATABASE_URI,
                     DATA_PATH, DEMO_PROJECTS_PATH, DEPLOY_PATH, PARSE_PATH,
                     ALERT_TRIGGER_KEYS, LEGAL_NAME_PATTERN, SCHEDULE_ADDITIONAL,
@@ -264,6 +264,13 @@ class BaseView(View):
     @staticmethod
     def handle_slash(string):
         return handle_slash(string)
+
+    def make_public_url(self, url):
+        # Rewrite an internal Scrapyd url to the reverse proxy public url configured
+        # for the current node (SCRAPYD_SERVERS_PUBLIC_URLS), or return it unchanged
+        # when no public url is set. Use this for every result link the browser
+        # follows to Scrapyd so reverse proxy users don't hit internal addresses.
+        return handle_public_url(url, self.SCRAPYD_SERVER_PUBLIC_URL)
 
     @staticmethod
     def json_dumps(obj, sort_keys=True, indent=4, ensure_ascii=False, as_response=False):

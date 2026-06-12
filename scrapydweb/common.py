@@ -102,5 +102,35 @@ def handle_slash(string):
         return string.replace('\\', '/')
 
 
+def handle_public_url(url, public_url):
+    """Rewrite an internal Scrapyd url to its reverse proxy public equivalent.
+
+    When public_url (an item of SCRAPYD_SERVERS_PUBLIC_URLS) is set for the current
+    node, replace the 'scheme://host[:port]' prefix of an internal Scrapyd url with
+    the configured public base url, keeping the rest of the url (path and query
+    string) untouched. This keeps every result link that points to Scrapyd itself
+    (Source, Items, the logs/items directory listings, stats.json ...) reachable for
+    users who can only access Scrapyd through the reverse proxy.
+
+    When public_url is empty (the default, i.e. no reverse proxy configured for the
+    node), the original url is returned unchanged so the direct-connection behavior
+    is preserved.
+
+    Note: only links that the browser follows to Scrapyd are rewritten; the urls
+    ScrapydWeb uses server-side to request Scrapyd are left untouched on purpose.
+    """
+    if not public_url:
+        return url
+    # SCRAPYD_SERVERS_PUBLIC_URLS items are already stripped of surrounding spaces
+    # and slashes in check_app_config(); strip again to stay correct for any caller.
+    public_url = public_url.rstrip('/')
+    # Build the replacement by concatenation instead of re.sub() to avoid having the
+    # public url interpreted as a regex replacement template (e.g. backslash escapes).
+    match = re.match(r'^https?://[^/]+', url)
+    if not match:
+        return url
+    return public_url + url[match.end():]
+
+
 def json_dumps(obj, sort_keys=True, indent=4, ensure_ascii=False):
     return json.dumps(obj, sort_keys=sort_keys, indent=indent, ensure_ascii=ensure_ascii)
