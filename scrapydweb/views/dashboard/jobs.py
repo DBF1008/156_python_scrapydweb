@@ -100,7 +100,7 @@ class JobsView(BaseView):
         if status_code != 200 or not re.search(r'<h1>Jobs</h1>', self.text):
             kwargs = dict(
                 node=self.node,
-                url=self.url,
+                url=self.public_url or self.url,
                 status_code=status_code,
                 text=self.text,
                 tip="Click the above link to make sure your Scrapyd server is accessable. "
@@ -409,10 +409,12 @@ class JobsView(BaseView):
     def set_kwargs(self):
         self.kwargs = dict(
             node=self.node,
-            url=self.url,
+            url=self.public_url or self.url,
             url_schedule=url_for('schedule', node=self.node),
             url_liststats=url_for('api', node=self.node, opt='liststats'),
-            url_liststats_source='http://%s/logs/stats.json' % self.SCRAPYD_SERVER,
+            url_liststats_source=('%s/logs/stats.json' % self.SCRAPYD_SERVER_PUBLIC_URL
+                                  if self.SCRAPYD_SERVER_PUBLIC_URL
+                                  else 'http://%s/logs/stats.json' % self.SCRAPYD_SERVER),
             SCRAPYD_SERVER=self.SCRAPYD_SERVER.split(':')[0],
             LOGPARSER_VERSION=self.LOGPARSER_VERSION,
             JOBS_RELOAD_INTERVAL=self.JOBS_RELOAD_INTERVAL,

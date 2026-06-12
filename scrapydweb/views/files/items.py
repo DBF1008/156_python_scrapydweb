@@ -32,7 +32,7 @@ class ItemsView(BaseView):
         if status_code != 200 or not re.search(r'Directory listing for /items/', self.text):
             kwargs = dict(
                 node=self.node,
-                url=self.url,
+                url=self.public_url or self.url,
                 status_code=status_code,
                 text=self.text,
                 tip="Click the above link to make sure your Scrapyd server is accessable. "
@@ -74,7 +74,7 @@ class ItemsView(BaseView):
             title='items',
             project=self.project,
             spider=self.spider,
-            url=self.url,
+            url=self.public_url or self.url,
             url_schedule=url_schedule,
             url_multinode_run=url_multinode_run,
             rows=rows
