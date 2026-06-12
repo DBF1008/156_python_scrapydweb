@@ -1,0 +1,66 @@
+{% extends 'base.html' %}
+
+{% block title %}choose scrapy.cfg{% endblock %}
+
+{% block head %}
+  <style>
+    h2 {color: #e6a23c;}
+    .candidate-list {margin: 16px 0; padding: 0;}
+    .candidate-list li {
+      list-style: none;
+      border: 1px solid #dcdfe6;
+      border-radius: 4px;
+      margin: 8px 0;
+      padding: 0;
+    }
+    .candidate-list li:hover {background-color: #f5f7fa;}
+    .candidate-list label {
+      display: block;
+      cursor: pointer;
+      padding: 12px 16px;
+      word-break: break-all;
+    }
+    .candidate-list .rel {font-weight: 700; color: #303133;}
+    .candidate-list .proj {color: #909399; margin-left: 12px;}
+    .meta {color: #606266; margin-bottom: 8px;}
+    .meta b {color: #303133;}
+  </style>
+{% endblock %}
+
+
+{% block body %}
+<h2>Multiple scrapy.cfg candidates found &mdash; choose which one to build.</h2>
+
+<div class="wrap">
+  <p class="meta">
+    More than one <code>scrapy.cfg</code> was discovered, so the deploy target is ambiguous.
+    Pick the project you actually want to package, then deploy again.
+  </p>
+  <p class="meta">project: <b>{{ project }}</b>&nbsp;&nbsp;&nbsp;version: <b>{{ version }}</b></p>
+
+  <form method="post" action="{{ url_deploy_upload }}" enctype="multipart/form-data">
+    <input type="hidden" name="project" value="{{ project }}" />
+    <input type="hidden" name="version" value="{{ version }}" />
+    {% if folder %}<input type="hidden" name="folder" value="{{ folder }}" />{% endif %}
+    {% if uploaded_filename %}<input type="hidden" name="uploaded_filename" value="{{ uploaded_filename }}" />{% endif %}
+    {% if SCRAPYD_SERVERS_AMOUNT > 1 %}
+    <input type="hidden" name="checked_amount" value="{{ selected_nodes_amount }}" />
+    {% for n in selected_nodes %}<input type="hidden" name="{{ n }}" value="on" />{% endfor %}
+    {% endif %}
+
+    <ul class="candidate-list">
+    {% for c in candidates %}
+      <li>
+        <label>
+          <input type="radio" name="scrapy_cfg" value="{{ c.rel }}" {% if loop.first %}checked{% endif %} />
+          <span class="rel">{{ c.rel }}</span>
+          <span class="proj">project: {{ c.project }}</span>
+        </label>
+      </li>
+    {% endfor %}
+    </ul>
+
+    <button type="submit" class="button safe big">Build &amp; Deploy selected</button>
+  </form>
+</div>
+{% endblock %}

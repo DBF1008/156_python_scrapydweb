@@ -198,6 +198,17 @@ class DeployUploadView(BaseView):
         self.scrapy_cfg_not_found = False
         self.scrapy_cfg_parse_error = ''
         self.build_egg_subprocess_error = ''
+        # Candidate discovery: collect every scrapy.cfg under the search root so the caller
+        # can see them and explicitly pick which one to build (instead of silently using the
+        # first one hit while walking).
+        self.scrapy_cfg_search_root = ''
+        self.scrapy_cfg_candidates = []  # [{'rel': ..., 'path': ..., 'project': ...}, ...]
+        self.scrapy_cfg_selected = ''  # relative path picked by the caller, if any
+        self.scrapy_cfg_chosen_rel = ''  # relative path actually resolved for building
+        self.scrapy_cfg_multiple = False  # >1 candidate and none selected -> show chooser
+        self.scrapy_cfg_invalid_selection = False  # selected path matched no candidate
+        self.uploaded_filename = ''  # archive persisted in DEPLOY_PATH, reused on re-submit
+        self.uncompress_tmpdir = ''
         self.data = None
         self.js = {}
 
@@ -205,6 +216,32 @@ class DeployUploadView(BaseView):
 
     def dispatch_request(self, **kwargs):
         self.handle_form()
+
+        if self.scrapy_cfg_multiple:
+            return render_template(
+                'scrapydweb/deploy_candidates.html',
+                node=self.node,
+                candidates=self.scrapy_cfg_candidates,
+                folder=self.folder,
+                uploaded_filename=self.uploaded_filename,
+                project=self.project,
+                version=self.version,
+                selected_nodes=self.selected_nodes,
+                selected_nodes_amount=self.selected_nodes_amount,
+                SCRAPYD_SERVERS_AMOUNT=self.SCRAPYD_SERVERS_AMOUNT,
+                url_deploy_upload=url_for('deploy.upload', node=self.node),
+            )
+
+        if self.scrapy_cfg_invalid_selection:
+            if self.selected_nodes_amount > 1:
+                alert = "Multinode deployment terminated:"
+            else:
+                alert = "Fail to deploy project:"
+            text = "The selected scrapy.cfg was not found among the discovered candidates"
+            tip = "Select one of the candidates listed below, then deploy again. "
+            message = "candidates:\n%s" % pformat([c['rel'] for c in self.scrapy_cfg_candidates])
+            return render_template(self.template_fail, node=self.node,
+                                   alert=alert, text=text, tip=tip, message=message)
 
         if self.scrapy_cfg_not_found or self.scrapy_cfg_parse_error or self.build_egg_subprocess_error:
             if self.selected_nodes_amount > 1:
@@ -294,8 +331,15 @@ class DeployUploadView(BaseView):
         self.project = re.sub(self.STRICT_NAME_PATTERN, '_', request.form.get('project', '')) or self.get_now_string()
         self.version = re.sub(self.LEGAL_NAME_PATTERN, '-', request.form.get('version', '')) or self.get_now_string()
 
+        # Optional explicit candidate selection (relative path of the chosen scrapy.cfg) and,
+        # for re-submission from the chooser, the archive already persisted in DEPLOY_PATH.
+        self.scrapy_cfg_selected = request.form.get('scrapy_cfg', '')
+        self.uploaded_filename = request.form.get('uploaded_filename', '')
+
         if request.files.get('file'):
             self.handle_uploaded_file()
+        elif self.uploaded_filename:
+            self.handle_uploaded_reselect()
         else:
             self.folder = request.form['folder']  # Used with SCRAPY_PROJECTS_DIR to get project_path
             self.handle_local_project()
@@ -304,13 +348,14 @@ class DeployUploadView(BaseView):
         # Use folder instead of project
         project_path = os.path.join(self.SCRAPY_PROJECTS_DIR, self.folder)
 
-        self.search_scrapy_cfg_path(project_path)
+        self.collect_scrapy_cfg_candidates(project_path)
+        self.resolve_scrapy_cfg()
+        # resolve_scrapy_cfg() flags scrapy_cfg_not_found / scrapy_cfg_multiple /
+        # scrapy_cfg_invalid_selection when a single target cannot be built right away.
         if not self.scrapy_cfg_path:
-            self.scrapy_cfg_not_found = True
             return
 
-        self.eggname = '%s_%s.egg' % (self.project, self.version)
-        self.eggpath = os.path.join(self.DEPLOY_PATH, self.eggname)
+        self.finalize_eggname('%s_%s.egg' % (self.project, self.version), self.scrapy_cfg_chosen_rel)
         self.build_egg()
 
     def handle_uploaded_file(self):
@@ -334,24 +379,16 @@ class DeployUploadView(BaseView):
         else:  # Compressed file
             filepath = os.path.join(self.DEPLOY_PATH, filename)
             file.save(filepath)
-            tmpdir = self.uncompress_to_tmpdir(filepath)
-
-            # Search from the root of tmpdir
-            self.search_scrapy_cfg_path(tmpdir)
-            if not self.scrapy_cfg_path:
-                self.scrapy_cfg_not_found = True
-                return
-
-            self.eggname = re.sub(r'(\.zip|\.tar\.gz)$', '.egg', filename)
-            self.eggpath = os.path.join(self.DEPLOY_PATH, self.eggname)
-            self.build_egg()
+            # Persist the archive name so the chooser can rebuild from it without re-uploading.
+            self.uploaded_filename = filename
+            self._process_archive(filepath, re.sub(r'(\.zip|\.tar\.gz)$', '.egg', filename))
 
     # https://gangmax.me/blog/2011/09/17/12-14-52-publish-532/
     # https://stackoverflow.com/a/49649784
     # When ScrapydWeb runs in Linux/macOS and tries to uncompress zip file from Windows_CN_cp936
     # UnicodeEncodeError: 'ascii' codec can't encode characters in position 7-8: ordinal not in range(128)
     # macOS + PY2 would raise OSError: Illegal byte sequence
-    # Ubuntu + PY2 would raise UnicodeDecodeError in search_scrapy_cfg_path() though f.extractall(tmpdir) works well
+    # Ubuntu + PY2 would raise UnicodeDecodeError in collect_scrapy_cfg_candidates() though f.extractall(tmpdir) works well
     def uncompress_to_tmpdir(self, filepath):
         self.logger.debug("Uncompressing %s", filepath)
         tmpdir = tempfile.mkdtemp(prefix="scrapydweb-uncompress-")
@@ -387,25 +424,106 @@ class DeployUploadView(BaseView):
         # print(type(tmpdir))
         return tmpdir.decode('utf8') if PY2 else tmpdir
 
-    def search_scrapy_cfg_path(self, search_path, func_walk=os.walk, retry=True):
+    def collect_scrapy_cfg_candidates(self, search_root, func_walk=os.walk, retry=True):
+        # Walk the whole tree and collect every scrapy.cfg, so nested projects, backup dirs and
+        # multiple candidate projects are all discoverable (the previous behaviour stopped at the
+        # first scrapy.cfg encountered during the walk).
+        self.scrapy_cfg_search_root = search_root
         try:
-            for dirpath, dirnames, filenames in func_walk(search_path):
+            for dirpath, dirnames, filenames in func_walk(search_root):
                 self.scrapy_cfg_searched_paths.append(os.path.abspath(dirpath))
-                self.scrapy_cfg_path = os.path.abspath(os.path.join(dirpath, 'scrapy.cfg'))
-                if os.path.exists(self.scrapy_cfg_path):
-                    self.logger.debug("scrapy_cfg_path: %s", self.scrapy_cfg_path)
-                    return
+                scrapy_cfg = os.path.abspath(os.path.join(dirpath, 'scrapy.cfg'))
+                if os.path.exists(scrapy_cfg):
+                    rel = os.path.relpath(scrapy_cfg, search_root).replace('\\', '/')
+                    project = ''
+                    try:
+                        project = get_config(scrapy_cfg).get('deploy', 'project')
+                    except (ScrapyCfgParseError, UnicodeDecodeError) as err:
+                        self.logger.debug("%s parse error for display: %s", scrapy_cfg, err)
+                    project = project or os.path.basename(os.path.dirname(scrapy_cfg))
+                    self.scrapy_cfg_candidates.append(dict(rel=rel, path=scrapy_cfg, project=project))
+                    self.logger.debug("scrapy_cfg candidate: %s (project %s)", scrapy_cfg, project)
         except UnicodeDecodeError:
-            msg = "Found illegal filenames in %s" % search_path
+            msg = "Found illegal filenames in %s" % search_root
             self.logger.error(msg)
             flash(msg, self.WARN)
             if PY2 and retry:
-                self.search_scrapy_cfg_path(search_path, func_walk=self.safe_walk, retry=False)
+                # Restart the walk with the unicode-safe variant; discard the partial results.
+                self.scrapy_cfg_candidates = []
+                self.scrapy_cfg_searched_paths = []
+                self.collect_scrapy_cfg_candidates(search_root, func_walk=self.safe_walk, retry=False)
+                return
             else:
                 raise
-        else:
-            self.logger.error("scrapy.cfg not found in: %s", search_path)
-            self.scrapy_cfg_path = ''
+        self.scrapy_cfg_candidates.sort(key=lambda c: c['rel'].lower())
+        if not self.scrapy_cfg_candidates:
+            self.logger.error("scrapy.cfg not found in: %s", search_root)
+
+    def resolve_scrapy_cfg(self):
+        # Decide which scrapy.cfg to build from the discovered candidates:
+        #   0 candidates                      -> not found
+        #   explicit selection given          -> build it (or flag an invalid selection)
+        #   exactly 1 candidate, no selection -> build it (single-project auto-packaging)
+        #   >1 candidates, no selection       -> let the caller choose (no build yet)
+        candidates = self.scrapy_cfg_candidates
+        if not candidates:
+            self.scrapy_cfg_not_found = True
+            return
+        if self.scrapy_cfg_selected:
+            selected = self.scrapy_cfg_selected.replace('\\', '/').strip()
+            match = next((c for c in candidates if c['rel'] == selected), None)
+            if match:
+                self.scrapy_cfg_path = match['path']
+                self.scrapy_cfg_chosen_rel = match['rel']
+            else:
+                self.scrapy_cfg_invalid_selection = True
+            return
+        if len(candidates) == 1:
+            self.scrapy_cfg_path = candidates[0]['path']
+            self.scrapy_cfg_chosen_rel = candidates[0]['rel']
+            return
+        self.scrapy_cfg_multiple = True
+
+    def finalize_eggname(self, base_egg_name, chosen_rel):
+        # Keep the canonical single-project name byte-identical. Only when more than one candidate
+        # exists and a nested one is chosen do we append a sanitized sub-path, so the eggs of
+        # different candidates never collide in DEPLOY_PATH.
+        eggname = base_egg_name
+        if len(self.scrapy_cfg_candidates) > 1:
+            sub_dir = os.path.dirname(chosen_rel)
+            if sub_dir:
+                suffix = re.sub(self.STRICT_NAME_PATTERN, '_', sub_dir)
+                eggname = '%s__%s.egg' % (base_egg_name[:-len('.egg')], suffix)
+        self.eggname = eggname
+        self.eggpath = os.path.join(self.DEPLOY_PATH, self.eggname)
+
+    def _process_archive(self, filepath, base_egg_name):
+        # Shared path for both the initial upload and the chooser re-submission: uncompress,
+        # discover candidates, resolve a target and build it. The temp dir is always cleaned up
+        # (the chooser re-submission rebuilds from the archive persisted in DEPLOY_PATH, so the
+        # uncompressed tree is never needed across requests).
+        tmpdir = self.uncompress_to_tmpdir(filepath)
+        self.uncompress_tmpdir = tmpdir
+        try:
+            self.collect_scrapy_cfg_candidates(tmpdir)
+            self.resolve_scrapy_cfg()
+            if not self.scrapy_cfg_path:
+                return
+            self.finalize_eggname(base_egg_name, self.scrapy_cfg_chosen_rel)
+            self.build_egg()
+        finally:
+            rmtree(tmpdir, ignore_errors=True)
+            self.uncompress_tmpdir = ''
+
+    def handle_uploaded_reselect(self):
+        # Re-submission from the candidate chooser: the archive was saved to DEPLOY_PATH during
+        # the initial upload, so rebuild from it instead of requiring the file to be re-uploaded.
+        filename = secure_filename(self.uploaded_filename)
+        filepath = os.path.join(self.DEPLOY_PATH, filename)
+        if not filename or not os.path.exists(filepath):
+            self.scrapy_cfg_not_found = True
+            return
+        self._process_archive(filepath, re.sub(r'(\.zip|\.tar\.gz)$', '.egg', filename))
 
     def build_egg(self):
         try:
@@ -419,8 +537,8 @@ class DeployUploadView(BaseView):
             self.build_egg_subprocess_error = err
             return
 
-        scrapy_cfg_dir = os.path.dirname(self.scrapy_cfg_path)
-        copyfile(egg, os.path.join(scrapy_cfg_dir, self.eggname))
+        # Land the egg only in the canonical DEPLOY_PATH; do not scatter it into the scanned
+        # source tree (which previously caused built eggs to mix with old artifacts there).
         copyfile(egg, self.eggpath)
         rmtree(tmpdir)
         self.logger.debug("Egg file saved to: %s", self.eggpath)
