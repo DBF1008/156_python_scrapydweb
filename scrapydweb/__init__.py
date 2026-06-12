@@ -213,10 +213,14 @@ def handle_route(app):
     from .views.dashboard.node_reports import NodeReportsView
     register_view(NodeReportsView, 'nodereports', [('nodereports', None)])
 
-    from .views.dashboard.cluster_reports import ClusterReportsView
+    from .views.dashboard.cluster_reports import ClusterReportsView, ClusterReportsJsonView
     register_view(ClusterReportsView, 'clusterreports', [
         ('clusterreports/<project>/<spider>/<job>', None),
         ('clusterreports', dict(project=None, spider=None, job=None))
+    ])
+    register_view(ClusterReportsJsonView, 'clusterreports.json', [
+        ('clusterreports/json/<project>/<spider>/<job>', None),
+        ('clusterreports/json', dict(project=None, spider=None, job=None))
     ])
 
     # Operations
