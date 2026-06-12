@@ -11,6 +11,7 @@ from ...common import handle_metadata
 from ...models import Task, TaskResult, TaskJobResult, db
 from ...vars import SCHEDULER_STATE_DICT, STATE_PAUSED, STATE_RUNNING, TIMER_TASKS_HISTORY_LOG
 from ..baseview import BaseView
+from ..operations.execute_task import mark_task_cancelled
 
 
 apscheduler_logger = logging.getLogger('apscheduler')
@@ -323,6 +324,9 @@ class TasksXhrView(BaseView):
         # In case that execute_task() has not finished
         # if task_result and (task_result.pass_count or task_result.fail_count):
         if task_result:
+            # Signal the running executor (if any) to stop writing before
+            # we cascade-delete its TaskResult and TaskJobResult rows.
+            mark_task_cancelled(self.task_id, self.task_result_id)
             db.session.delete(task_result)
             db.session.commit()
             self.js['tip'] = "task_result #%s deleted. " % self.task_result_id
@@ -341,6 +345,9 @@ class TasksXhrView(BaseView):
             else:
                 self.js['tip'] = "apscheduler_job #%s not found. " % self.task_id
         if self.task:
+            # Signal the running executor (if any) to stop writing before
+            # we cascade-delete its Task / TaskResult / TaskJobResult rows.
+            mark_task_cancelled(self.task_id)
             db.session.delete(self.task)
             db.session.commit()
             msg = "Task #%s deleted. " % self.task_id

@@ -2,6 +2,7 @@
 import json
 import logging
 import re
+import threading
 import time
 import traceback
 
@@ -14,6 +15,57 @@ apscheduler_logger = logging.getLogger('apscheduler')
 
 REPLACE_URL_NODE_PATTERN = re.compile(r'^/(\d+)/')
 EXTRACT_URL_SERVER_PATTERN = re.compile(r'//(.+?:\d+)')
+
+
+# ---------------------------------------------------------------------------
+# In-process cancellation registry
+# ---------------------------------------------------------------------------
+# When a Task or TaskResult is deleted from the web UI while an executor
+# thread is still running, the delete handler calls mark_task_cancelled()
+# so the executor can notice and stop writing to the database.  This avoids
+# orphan TaskJobResult rows and stale pass/fail counts that would otherwise
+# appear when the executor's INSERT races with the cascade DELETE.
+# ---------------------------------------------------------------------------
+_cancel_lock = threading.Lock()
+_cancelled_tasks = set()          # {task_id, ...}
+_cancelled_task_results = set()   # {(task_id, task_result_id), ...}
+
+
+def mark_task_cancelled(task_id, task_result_id=None):
+    """Signal to any running executor that *task_id* (and optionally a
+    specific *task_result_id*) has been deleted and should be abandoned."""
+    with _cancel_lock:
+        if task_result_id is None:
+            # Whole task deleted — cancel everything for this task_id
+            _cancelled_tasks.add(task_id)
+        else:
+            # Only a specific task_result deleted — cancel that result
+            # without affecting the task itself (other results keep running)
+            _cancelled_task_results.add((task_id, task_result_id))
+
+
+def is_task_cancelled(task_id, task_result_id=None):
+    """Return ``True`` if *task_id* (or the specific *task_result_id*)
+    has been marked as cancelled."""
+    with _cancel_lock:
+        if task_id in _cancelled_tasks:
+            return True
+        if task_result_id is not None and (task_id, task_result_id) in _cancelled_task_results:
+            return True
+        return False
+
+
+def clear_task_cancelled(task_id):
+    """Remove all cancellation markers for *task_id*.
+
+    Called at the beginning of ``execute_task()`` so that a stale marker
+    left by a previous run does not interfere with a fresh execution.
+    """
+    with _cancel_lock:
+        _cancelled_tasks.discard(task_id)
+        to_remove = [k for k in _cancelled_task_results if k[0] == task_id]
+        for k in to_remove:
+            _cancelled_task_results.discard(k)
 
 
 class TaskExecutor(object):
@@ -39,18 +91,39 @@ class TaskExecutor(object):
         self.nodes_to_retry = []
         self.logger = logging.getLogger(self.__class__.__name__)
 
+    # -- cancellation helpers ------------------------------------------------
+
+    def _is_cancelled(self):
+        """Check whether the current task or its result has been deleted
+        from the web UI while this executor is still running."""
+        return is_task_cancelled(self.task_id, self.task_result_id)
+
+    # -- main flow -----------------------------------------------------------
+
     def main(self):
         self.get_task_result_id()
         for index, nodes in enumerate([self.selected_nodes, self.nodes_to_retry]):
             if not nodes:
                 continue
             if index == 1:
+                # Abort retry round if cancelled while we were sleeping
+                if self._is_cancelled():
+                    apscheduler_logger.warning(
+                        "Task #%s (%s) cancelled before retry, aborting",
+                        self.task_id, self.task_name)
+                    break
                 # https://apscheduler.readthedocs.io/en/latest/userguide.html#shutting-down-the-scheduler
                 self.logger.warning("Retry task #%s (%s) on nodes %s in %s seconds",
                                     self.task_id, self.task_name, nodes, self.sleep_seconds_before_retry)
                 time.sleep(self.sleep_seconds_before_retry)
                 self.logger.warning("Retrying task #%s (%s) on nodes %s", self.task_id, self.task_name, nodes)
             for node in nodes:
+                # Check cancellation before each node so we stop early
+                if self._is_cancelled():
+                    apscheduler_logger.warning(
+                        "Task #%s (%s) cancelled during execution, aborting remaining nodes",
+                        self.task_id, self.task_name)
+                    break
                 result = self.schedule_task(node)
                 if result:
                     if result['status'] == 'ok':
@@ -58,6 +131,11 @@ class TaskExecutor(object):
                     else:
                         self.fail_count += 1
                     self.db_insert_task_job_result(result)
+            else:
+                # only continues outer loop when inner loop was NOT broken
+                continue
+            # inner loop was broken (cancelled) → also break outer loop
+            break
         self.db_update_task_result()
 
     def get_task_result_id(self):
@@ -104,7 +182,19 @@ class TaskExecutor(object):
         return js
 
     def db_insert_task_job_result(self, js):
+        # Check cancellation BEFORE touching the database so we never
+        # create an orphan TaskJobResult whose parent TaskResult was
+        # cascade-deleted by a concurrent delete handler.
+        if self._is_cancelled():
+            apscheduler_logger.warning(
+                "Task #%s or task_result #%s cancelled, discard task_job_result: %s",
+                self.task_id, self.task_result_id, js)
+            return
+
         with db.app.app_context():
+            # Re-verify inside the app context: the cascade DELETE from
+            # delete_task() / delete_task_result() may have committed
+            # between our cancellation check above and this point.
             if not TaskResult.query.get(self.task_result_id):
                 apscheduler_logger.error("task_result #%s of task #%s not found", self.task_result_id, self.task_id)
                 apscheduler_logger.warning("Discard task_job_result of task_result #%s of task #%s: %s",
@@ -123,24 +213,37 @@ class TaskExecutor(object):
 
     # https://stackoverflow.com/questions/13895176/sqlalchemy-and-sqlite-database-is-locked
     def db_update_task_result(self):
+        # If cancelled before we even created a TaskResult, nothing to do.
+        if self.task_result_id is None:
+            return
+
         with db.app.app_context():
             task = Task.query.get(self.task_id)
             task_result = TaskResult.query.get(self.task_result_id)
-            if not task:
-                apscheduler_logger.error("Task #%s not found", self.task_id)
-                # if task_result:
-                # '/1/tasks/xhr/delete/1/1/'
-                url_delete_task_result = re.sub(r'/\d+/\d+/$', '/%s/%s/' % (self.task_id, self.task_result_id),
-                                                self.url_delete_task_result)
-                js = get_response_from_view(url_delete_task_result, auth=self.auth, data=self.data, as_json=True)
-                apscheduler_logger.warning("Deleted task_result #%s [FAIL %s, PASS %s] of task #%s: %s",
-                                           self.task_result_id, self.fail_count, self.pass_count, self.task_id, js)
+
+            if not task or self._is_cancelled():
+                # The task was deleted (or marked cancelled) while we were
+                # running.  Clean up the orphan TaskResult we created in
+                # get_task_result_id() so the database stays consistent.
+                apscheduler_logger.warning(
+                    "Task #%s not found or cancelled, cleaning up orphan task_result #%s",
+                    self.task_id, self.task_result_id)
+                if task_result:
+                    db.session.delete(task_result)
+                    db.session.commit()
                 return
+
             if not task_result:
-                apscheduler_logger.error("task_result #%s of task #%s not found", self.task_result_id, self.task_id)
-                apscheduler_logger.warning("Failed to update task_result #%s [FAIL %s, PASS %s] of task #%s",
-                                           self.task_result_id, self.fail_count, self.pass_count, self.task_id)
+                # The TaskResult was deleted concurrently (e.g. by
+                # delete_task_result()).  Counts are lost; nothing we can
+                # update, but this is NOT an error — the user explicitly
+                # asked for the deletion.
+                apscheduler_logger.warning(
+                    "task_result #%s of task #%s was deleted during execution, "
+                    "skip updating pass/fail counts [FAIL %s, PASS %s]",
+                    self.task_result_id, self.task_id, self.fail_count, self.pass_count)
                 return
+
             task_result.fail_count = self.fail_count
             task_result.pass_count = self.pass_count
             db.session.commit()
@@ -148,12 +251,21 @@ class TaskExecutor(object):
 
 
 def execute_task(task_id):
+    # Clear any stale cancellation marker left from a previous run of the
+    # same task_id (the set is additive and never auto-cleaned otherwise).
+    clear_task_cancelled(task_id)
+
     with db.app.app_context():
         task = Task.query.get(task_id)
         apscheduler_job = scheduler.get_job(str(task_id))
         if not task:
-            apscheduler_job.remove()
-            apscheduler_logger.error("apscheduler_job #{id} removed since task #{id} not exist. ".format(id=task_id))
+            if apscheduler_job:
+                apscheduler_job.remove()
+                apscheduler_logger.error("apscheduler_job #{id} removed since task #{id} not exist. "
+                                         .format(id=task_id))
+            else:
+                apscheduler_logger.error("Task #{id} not exist and apscheduler_job #{id} already gone. "
+                                         .format(id=task_id))
         else:
             metadata = handle_metadata()
             username = metadata.get('username', '')

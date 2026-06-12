@@ -368,4 +368,130 @@ def test_delete_task_or_task_result_on_the_fly(app, client):
                      kws=dict(node=NODE, action='list', task_id=task_id, task_result_id=task_result_id))
         assert len(js['ids']) == 0
 
+        # Regression: verify no orphan TaskJobResult rows survive whose
+        # parent TaskResult has been cascade-deleted.  Before the fix the
+        # executor thread could INSERT new TaskJobResult rows *after* the
+        # cascade DELETE committed, leaving dangling records.
+        with app.app_context():
+            from scrapydweb.models import TaskResult as _TR, TaskJobResult as _TJR
+            orphan_task_results = _TR.query.filter_by(task_id=task_id).all()
+            assert len(orphan_task_results) == 0, (
+                "Orphan TaskResult rows remain for deleted task #%s: %s"
+                % (task_id, orphan_task_results))
+            all_tjr_ids = [tjr.id for tjr in _TJR.query.all()]
+            valid_tr_ids = [tr.id for tr in _TR.query.all()]
+            orphans = _TJR.query.filter(~_TJR.task_result_id.in_(valid_tr_ids)).all() if valid_tr_ids else _TJR.query.all()  # noqa: E501
+            assert len(orphans) == 0, (
+                "Orphan TaskJobResult rows found: %s" % orphans)
+
         req(app, client, view='tasks.xhr', kws=dict(node=1, action='delete', task_id=task_id))
+
+
+# ---------------------------------------------------------------------------
+# Regression test: deterministic verification that the cancellation registry
+# prevents the executor from writing to the DB after a concurrent delete.
+# Uses monkey-patching to inject a controllable delay inside the executor.
+# ---------------------------------------------------------------------------
+def test_cancelled_executor_does_not_write_orphans(app, client, monkeypatch):
+    """Patch TaskExecutor.schedule_task to sleep so we can delete the task
+    (or task_result) from the main thread while the executor is mid-flight,
+    then verify no orphan records remain."""
+    import threading
+    from scrapydweb.views.operations.execute_task import (
+        TaskExecutor, mark_task_cancelled, clear_task_cancelled,
+    )
+
+    upload_file_deploy(app, client, filename='ScrapydWeb_demo_no_request.egg',
+                       project=cst.PROJECT, redirect_project=cst.PROJECT)
+    req(app, client, view='tasks.xhr', kws=dict(node=NODE, action='enable'),
+        ins='STATE_RUNNING', nos='STATE_PAUSED')
+
+    for kind in ['delete_task', 'delete_task_result']:
+        check_data_ = dict(check_data)
+        req(app, client, view='schedule.check', kws=dict(node=NODE), data=check_data_,
+            jskws=dict(cmd="-d _version=%s" % cst.VERSION, filename=FILENAME))
+
+        with app.test_request_context():
+            text, __ = req(app, client, view='schedule.run', kws=dict(node=NODE), data=run_data,
+                           location=url_for('tasks', node=NODE))
+        m = re.search(cst.TASK_NEXT_RUN_TIME_PATTERN, unquote_plus(text))
+        task_id = int(m.group(1))
+        print("[cancel-regression] task_id: %s, kind: %s" % (task_id, kind))
+
+        # Inject a long sleep inside schedule_task so we have a reliable
+        # window to delete the task/result from the main thread.
+        gate_entered = threading.Event()
+        gate_release = threading.Event()
+        _orig_schedule_task = TaskExecutor.schedule_task
+
+        def _slow_schedule_task(self, node):
+            gate_entered.set()          # tell main thread we are inside
+            gate_release.wait(15)       # block until main thread says go
+            return _orig_schedule_task(self, node)
+
+        monkeypatch.setattr(TaskExecutor, 'schedule_task', _slow_schedule_task)
+
+        # Wait for the first execution to start (TaskResult created,
+        # executor enters schedule_task).
+        sleep(2)
+        __, js = req(app, client, view='tasks.xhr',
+                     kws=dict(node=NODE, action='list', task_id=task_id))
+        assert len(js['ids']) >= 1, "TaskResult not yet created for task #%s" % task_id
+        task_result_id = js['ids'][0]
+
+        # Wait until the executor thread is parked inside _slow_schedule_task
+        assert gate_entered.wait(10), "executor never entered schedule_task"
+
+        # Now delete while the executor is sleeping
+        if kind == 'delete_task':
+            req(app, client, view='tasks.xhr',
+                kws=dict(node=NODE, action='delete', task_id=task_id))
+        else:
+            req(app, client, view='tasks.xhr',
+                kws=dict(node=NODE, action='delete', task_id=task_id,
+                         task_result_id=task_result_id))
+
+        # Release the executor thread
+        gate_release.set()
+
+        # Wait for the executor thread to finish its cleanup
+        sleep(5)
+
+        # --- verify: no orphans ---
+        __, js = req(app, client, view='tasks.xhr', kws=dict(node=NODE, action='list'))
+        if kind == 'delete_task':
+            assert task_id not in js['ids'], \
+                "task #%s should be gone after delete_task" % task_id
+
+        __, js = req(app, client, view='tasks.xhr',
+                     kws=dict(node=NODE, action='list', task_id=task_id))
+        assert len(js['ids']) == 0, \
+            "No TaskResult should survive for deleted task #%s, got %s" % (task_id, js['ids'])
+
+        __, js = req(app, client, view='tasks.xhr',
+                     kws=dict(node=NODE, action='list', task_id=task_id,
+                              task_result_id=task_result_id))
+        assert len(js['ids']) == 0, \
+            "No TaskJobResult should survive for deleted task_result #%s, got %s" \
+            % (task_result_id, js['ids'])
+
+        with app.app_context():
+            from scrapydweb.models import TaskResult as _TR, TaskJobResult as _TJR
+            orphan_trs = _TR.query.filter_by(task_id=task_id).all()
+            assert len(orphan_trs) == 0, \
+                "Orphan TaskResult for task #%s: %s" % (task_id, orphan_trs)
+            all_valid_tr_ids = set(tr.id for tr in _TR.query.all())
+            orphans = [tjr for tjr in _TJR.query.all()
+                       if tjr.task_result_id not in all_valid_tr_ids]
+            assert len(orphans) == 0, \
+                "Orphan TaskJobResult rows: %s" % orphans
+
+        # Undo the monkey-patch for the next iteration
+        monkeypatch.undo()
+
+        # Final cleanup: remove any leftover apscheduler_job / task
+        req(app, client, view='tasks.xhr',
+            kws=dict(node=NODE, action='delete', task_id=task_id,
+                     task_result_id=task_result_id))
+        req(app, client, view='tasks.xhr',
+            kws=dict(node=NODE, action='delete', task_id=task_id))
