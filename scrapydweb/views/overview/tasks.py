@@ -8,7 +8,7 @@ from flask import Blueprint, flash, render_template, request, send_file, url_for
 from sqlalchemy import and_
 
 from ...common import handle_metadata
-from ...models import Task, TaskResult, TaskJobResult, db
+from ...models import Task, TaskResult, TaskJobResult, db, task_result_lock
 from ...vars import SCHEDULER_STATE_DICT, STATE_PAUSED, STATE_RUNNING, TIMER_TASKS_HISTORY_LOG
 from ..baseview import BaseView
 
@@ -319,16 +319,19 @@ class TasksXhrView(BaseView):
         self.js['tip'] = "Scheduler after '%s': %s" % (self.action, SCHEDULER_STATE_DICT[self.scheduler.state])
 
     def delete_task_result(self):
-        task_result = TaskResult.query.get(self.task_result_id)
         # In case that execute_task() has not finished
         # if task_result and (task_result.pass_count or task_result.fail_count):
-        if task_result:
-            db.session.delete(task_result)
-            db.session.commit()
-            self.js['tip'] = "task_result #%s deleted. " % self.task_result_id
-        else:
-            self.js['status'] = self.ERROR
-            self.js['message'] = "task_result #%s not found. " % self.task_result_id
+        # Hold task_result_lock so this delete cannot interleave inside the executor's
+        # check-then-insert/finalize, which would otherwise leave an orphan task_job_result.
+        with task_result_lock:
+            task_result = TaskResult.query.get(self.task_result_id)
+            if task_result:
+                db.session.delete(task_result)
+                db.session.commit()
+                self.js['tip'] = "task_result #%s deleted. " % self.task_result_id
+            else:
+                self.js['status'] = self.ERROR
+                self.js['message'] = "task_result #%s not found. " % self.task_result_id
 
     def delete_task(self):
         # Actually, the 'delete a task' button is available only when  apscheduler_job is None
@@ -341,8 +344,11 @@ class TasksXhrView(BaseView):
             else:
                 self.js['tip'] = "apscheduler_job #%s not found. " % self.task_id
         if self.task:
-            db.session.delete(self.task)
-            db.session.commit()
+            # Hold task_result_lock only around the DB delete (the cascade removes this task's
+            # task_result / task_job_result rows). apscheduler_job.remove() above stays outside it.
+            with task_result_lock:
+                db.session.delete(self.task)
+                db.session.commit()
             msg = "Task #%s deleted. " % self.task_id
             apscheduler_logger.warning(msg)
             self.js['tip'] += msg
@@ -436,12 +442,13 @@ class TasksXhrView(BaseView):
 
         if self.KEEP_TASK_RESULT_LIMIT:
             count_before = TaskResult.query.count()
-            task_results = TaskResult.query.filter(condition).order_by(
-                TaskResult.execute_time.desc()).offset(self.KEEP_TASK_RESULT_LIMIT).all()
-            for task_result in task_results:
-                self.logger.debug("delete TaskResult: %s" % task_result)
-                db.session.delete(task_result)
-            db.session.commit()
+            with task_result_lock:
+                task_results = TaskResult.query.filter(condition).order_by(
+                    TaskResult.execute_time.desc()).offset(self.KEEP_TASK_RESULT_LIMIT).all()
+                for task_result in task_results:
+                    self.logger.debug("delete TaskResult: %s" % task_result)
+                    db.session.delete(task_result)
+                db.session.commit()
             count_after = TaskResult.query.count()
             self.logger.info("KEEP_TASK_RESULT_LIMIT: %s, total TaskResult: from %s to %s" % (
                 self.KEEP_TASK_RESULT_LIMIT, count_before, count_after))
@@ -453,11 +460,12 @@ class TasksXhrView(BaseView):
             # timedelta(days=0, seconds=0, microseconds=0, milliseconds=0, minutes=0, hours=0, weeks=0)
             n_days_ago = datetime.now() - timedelta(days=self.KEEP_TASK_RESULT_WITHIN_DAYS)
 
-            task_results = TaskResult.query.filter(TaskResult.execute_time <= n_days_ago, condition).all()
-            for task_result in task_results:
-                self.logger.debug("delete TaskResult: %s" % task_result)
-                db.session.delete(task_result)
-            db.session.commit()
+            with task_result_lock:
+                task_results = TaskResult.query.filter(TaskResult.execute_time <= n_days_ago, condition).all()
+                for task_result in task_results:
+                    self.logger.debug("delete TaskResult: %s" % task_result)
+                    db.session.delete(task_result)
+                db.session.commit()
 
             count_after = TaskResult.query.count()
             self.logger.info("KEEP_TASK_RESULT_WITHIN_DAYS: %s, total TaskResult: from %s to %s" % (

@@ -6,7 +6,7 @@ import time
 import traceback
 
 from ...common import get_now_string, get_response_from_view, handle_metadata
-from ...models import Task, TaskResult, TaskJobResult, db
+from ...models import Task, TaskResult, TaskJobResult, db, task_result_lock
 from ...utils.scheduler import scheduler
 
 
@@ -41,6 +41,9 @@ class TaskExecutor(object):
 
     def main(self):
         self.get_task_result_id()
+        if self.task_result_id is None:
+            # Task was deleted before this execution could create its task_result; nothing to do.
+            return
         for index, nodes in enumerate([self.selected_nodes, self.nodes_to_retry]):
             if not nodes:
                 continue
@@ -63,13 +66,20 @@ class TaskExecutor(object):
     def get_task_result_id(self):
         # SQLite objects created in a thread can only be used in that same thread
         with db.app.app_context():
-            task_result = TaskResult()
-            task_result.task_id = self.task_id
-            db.session.add(task_result)
-            # db.session.flush()  # Get task_result.id before committing, flush() is part of commit()
-            db.session.commit()
-            # If directly use task_result.id later: Instance <TaskResult at 0x123> is not bound to a Session
-            self.task_result_id = task_result.id
+            with task_result_lock:
+                # Re-check inside the lock: if the task was deleted from the Timer Tasks page while
+                # this execution was starting up, skip creating the task_result so we never leave an
+                # orphan task_result (and, later, orphan task_job_result) behind.
+                if not Task.query.get(self.task_id):
+                    apscheduler_logger.warning("Task #%s not found, skip creating task_result", self.task_id)
+                    return
+                task_result = TaskResult()
+                task_result.task_id = self.task_id
+                db.session.add(task_result)
+                # db.session.flush()  # Get task_result.id before committing, flush() is part of commit()
+                db.session.commit()
+                # If directly use task_result.id later: Instance <TaskResult at 0x123> is not bound to a Session
+                self.task_result_id = task_result.id
             self.logger.debug("Get new task_result_id %s for task #%s", self.task_result_id, self.task_id)
 
     def schedule_task(self, node):
@@ -104,29 +114,57 @@ class TaskExecutor(object):
         return js
 
     def db_insert_task_job_result(self, js):
+        if self.task_result_id is None:
+            return
         with db.app.app_context():
-            if not TaskResult.query.get(self.task_result_id):
-                apscheduler_logger.error("task_result #%s of task #%s not found", self.task_result_id, self.task_id)
-                apscheduler_logger.warning("Discard task_job_result of task_result #%s of task #%s: %s",
-                                           self.task_result_id, self.task_id, js)
-                return
-            task_job_result = TaskJobResult()
-            task_job_result.task_result_id = self.task_result_id
-            task_job_result.node = js['node']
-            task_job_result.server = re.search(EXTRACT_URL_SERVER_PATTERN, js['url']).group(1)  # '127.0.0.1:6800'
-            task_job_result.status_code = js['status_code']
-            task_job_result.status = js['status']
-            task_job_result.result = js.get('jobid', '') or js.get('message', '') or js.get('exception', '')
-            db.session.add(task_job_result)
-            db.session.commit()
-            self.logger.info("Inserted task_job_result: %s", task_job_result)
+            with task_result_lock:
+                # Re-check existence and insert atomically w.r.t. deletions: holding the lock means a
+                # concurrent delete cannot slip in between this check and the commit, so we never
+                # commit a task_job_result that points at an already-deleted task_result.
+                if not TaskResult.query.get(self.task_result_id):
+                    apscheduler_logger.error("task_result #%s of task #%s not found", self.task_result_id, self.task_id)
+                    apscheduler_logger.warning("Discard task_job_result of task_result #%s of task #%s: %s",
+                                               self.task_result_id, self.task_id, js)
+                    return
+                task_job_result = TaskJobResult()
+                task_job_result.task_result_id = self.task_result_id
+                task_job_result.node = js['node']
+                task_job_result.server = re.search(EXTRACT_URL_SERVER_PATTERN, js['url']).group(1)  # '127.0.0.1:6800'
+                task_job_result.status_code = js['status_code']
+                task_job_result.status = js['status']
+                task_job_result.result = js.get('jobid', '') or js.get('message', '') or js.get('exception', '')
+                db.session.add(task_job_result)
+                db.session.commit()
+                self.logger.info("Inserted task_job_result: %s", task_job_result)
 
     # https://stackoverflow.com/questions/13895176/sqlalchemy-and-sqlite-database-is-locked
     def db_update_task_result(self):
+        if self.task_result_id is None:
+            return
         with db.app.app_context():
-            task = Task.query.get(self.task_id)
-            task_result = TaskResult.query.get(self.task_result_id)
-            if not task:
+            task_missing = False
+            with task_result_lock:
+                task = Task.query.get(self.task_id)
+                task_result = TaskResult.query.get(self.task_result_id)
+                if not task:
+                    # Defer the self-heal delete until the lock is released (see below).
+                    task_missing = True
+                elif not task_result:
+                    apscheduler_logger.error("task_result #%s of task #%s not found", self.task_result_id, self.task_id)
+                    apscheduler_logger.warning("Failed to update task_result #%s [FAIL %s, PASS %s] of task #%s",
+                                               self.task_result_id, self.fail_count, self.pass_count, self.task_id)
+                    return
+                else:
+                    task_result.fail_count = self.fail_count
+                    task_result.pass_count = self.pass_count
+                    db.session.commit()
+                    self.logger.info("Inserted task_result: %s", task_result)
+                    return
+            # The task was deleted while this execution was running: delete the now-stale task_result
+            # it created. This runs OUTSIDE task_result_lock (get_response_from_view re-enters
+            # delete_task_result in this same thread and would otherwise deadlock), but still inside
+            # the app_context so current_app is bound for app.test_client().
+            if task_missing:
                 apscheduler_logger.error("Task #%s not found", self.task_id)
                 # if task_result:
                 # '/1/tasks/xhr/delete/1/1/'
@@ -135,16 +173,6 @@ class TaskExecutor(object):
                 js = get_response_from_view(url_delete_task_result, auth=self.auth, data=self.data, as_json=True)
                 apscheduler_logger.warning("Deleted task_result #%s [FAIL %s, PASS %s] of task #%s: %s",
                                            self.task_result_id, self.fail_count, self.pass_count, self.task_id, js)
-                return
-            if not task_result:
-                apscheduler_logger.error("task_result #%s of task #%s not found", self.task_result_id, self.task_id)
-                apscheduler_logger.warning("Failed to update task_result #%s [FAIL %s, PASS %s] of task #%s",
-                                           self.task_result_id, self.fail_count, self.pass_count, self.task_id)
-                return
-            task_result.fail_count = self.fail_count
-            task_result.pass_count = self.pass_count
-            db.session.commit()
-            self.logger.info("Inserted task_result: %s", task_result)
 
 
 def execute_task(task_id):

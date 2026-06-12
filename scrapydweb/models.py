@@ -1,6 +1,7 @@
 # coding: utf-8
 from datetime import datetime
 from pprint import pformat
+import threading
 import time
 
 from flask_sqlalchemy import SQLAlchemy
@@ -9,6 +10,16 @@ from .vars import STATE_RUNNING
 
 
 db = SQLAlchemy(session_options=dict(autocommit=False, autoflush=True))
+
+
+# Coordinates the apscheduler executor thread (which creates a task_result, inserts task_job_result
+# rows, and finalizes the FAIL/PASS counts) with the Timer Tasks page / periodic cleanup that delete
+# a task or a task_result. They run in the same process but in different threads with independent
+# sessions, and SQLite foreign keys are not enforced, so without this lock a delete that lands while
+# a task is executing leaves orphan task_job_result rows or wrong counts.
+# IMPORTANT: only ever hold this lock around pure-DB critical sections. Never hold it across a call
+# that re-enters a view via get_response_from_view()/app.test_client() (same-thread, would deadlock).
+task_result_lock = threading.Lock()
 
 
 # TODO: Database Migrations https://blog.miguelgrinberg.com/post/the-flask-mega-tutorial-part-iv-database
