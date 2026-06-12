@@ -1,6 +1,7 @@
 # coding: utf-8
 from datetime import datetime
 from io import BytesIO
+import io
 import json
 import os
 import re
@@ -9,6 +10,10 @@ import time
 from flask import url_for
 
 from scrapydweb.utils.poll import main as poll_py_main
+from scrapydweb.vars import LEGAL_NAME_PATTERN, STATS_PATH
+from scrapydweb.views.files.log import (
+    job_data_dict, job_finished_key_dict, job_finished_report_dict,
+)
 from tests.utils import cst, req, sleep, upload_file_deploy
 
 
@@ -97,6 +102,124 @@ def test_log_utf8_stats(app, client):
         # delete id not exist
         req(app, client, view='jobs.xhr', kws=dict(node=1, action='delete', id=cst.BIGINT),
             jskws=dict(status=cst.ERROR))
+
+
+def test_delete_job_cleans_caches(app, client):
+    """Regression: deleting a finished job must clear the report cache,
+    the stats-finished-key cache, the monitor-state cache, and the backup
+    stats file on disk so that the report page and stats page stop serving
+    stale results.  Deleting a running job must only clear the monitor state
+    and preserve the backup stats file for recovery fallback.
+    """
+    upload_file_deploy(app, client, filename='ScrapydWeb_demo.egg',
+                       project=cst.PROJECT, redirect_project=cst.PROJECT)
+
+    with app.test_request_context():
+        # Start a job and let it finish (forcestop)
+        kws = dict(node=1, opt='start', project=cst.PROJECT, version_spider_job=cst.SPIDER)
+        __, js = req(app, client, view='api', kws=kws)
+        jobid = js['jobid']
+        sleep()
+
+        client.get(url_for('api', node=1, opt='forcestop', project=cst.PROJECT,
+                           version_spider_job=jobid))
+        sleep()
+
+        # Persist the finished job to the DB via the Jobs page
+        jobs_key = '%s/%s/%s' % (cst.PROJECT, cst.SPIDER, jobid)
+        __, js = req(app, client, view='jobs', kws=dict(node=1), data={}, jskeys=jobs_key)
+        jobs_id = js[jobs_key]['id']
+
+        job_key = '/1/%s/%s/%s' % (cst.PROJECT, cst.SPIDER, jobid)
+
+        # Build the backup stats file path that LogView.backup_stats() uses
+        scrapyd_server = app.config['_SCRAPYD_SERVER']
+        node_dir = re.sub(LEGAL_NAME_PATTERN, '-', re.sub(r'[.:]', '_', scrapyd_server))
+        backup_json = os.path.join(STATS_PATH, node_dir, cst.PROJECT, cst.SPIDER,
+                                   jobid + '.json')
+
+        # --- Scenario 1: deleting a FINISHED job cleans everything ---
+
+        # Pre-populate in-memory caches to simulate prior visits to the
+        # Stats page and the Cluster Reports page.
+        job_finished_report_dict[1][job_key] = {
+            'from_memory': True, 'status': 'ok', 'pages': 10, 'items': 5,
+        }
+        job_finished_key_dict[1][job_key] = None
+        job_data_dict[job_key] = ([0] * 8, [False] * 6, False, time.time())
+
+        # Pre-create a backup stats file on disk
+        backup_dir = os.path.dirname(backup_json)
+        if not os.path.isdir(backup_dir):
+            os.makedirs(backup_dir)
+        with io.open(backup_json, 'w', encoding='utf-8') as f:
+            f.write(u'{"logparser_version": "0.0.0", "status": "ok"}')
+
+        # Sanity-check: everything is populated before the delete
+        assert job_key in job_finished_report_dict[1]
+        assert job_key in job_finished_key_dict[1]
+        assert job_key in job_data_dict
+        assert os.path.isfile(backup_json)
+
+        # Delete the finished job via JobsXhrView
+        req(app, client, view='jobs.xhr', kws=dict(node=1, action='delete', id=jobs_id),
+            jskws=dict(status=cst.OK))
+
+        # All caches must be empty for this job and the file must be gone
+        assert job_key not in job_finished_report_dict[1], \
+            "job_finished_report_dict should be cleaned after deleting finished job"
+        assert job_key not in job_finished_key_dict[1], \
+            "job_finished_key_dict should be cleaned after deleting finished job"
+        assert job_key not in job_data_dict, \
+            "job_data_dict should be cleaned after deleting finished job"
+        assert not os.path.isfile(backup_json), \
+            "backup stats file should be removed after deleting finished job"
+
+        # --- Scenario 2: deleting a RUNNING job preserves backup stats ---
+
+        # Start another job (leave it running)
+        kws2 = dict(node=1, opt='start', project=cst.PROJECT, version_spider_job=cst.SPIDER)
+        __, js2 = req(app, client, view='api', kws=kws2)
+        jobid2 = js2['jobid']
+        sleep()
+
+        # Persist the running job to the DB
+        jobs_key2 = '%s/%s/%s' % (cst.PROJECT, cst.SPIDER, jobid2)
+        __, js2 = req(app, client, view='jobs', kws=dict(node=1), data={}, jskeys=jobs_key2)
+        jobs_id2 = js2[jobs_key2]['id']
+
+        job_key2 = '/1/%s/%s/%s' % (cst.PROJECT, cst.SPIDER, jobid2)
+        backup_json2 = os.path.join(STATS_PATH, node_dir, cst.PROJECT, cst.SPIDER,
+                                    jobid2 + '.json')
+
+        # Pre-populate monitor state and create a backup stats file
+        job_data_dict[job_key2] = ([0] * 8, [False] * 6, False, time.time())
+        with io.open(backup_json2, 'w', encoding='utf-8') as f:
+            f.write(u'{"logparser_version": "0.0.0", "status": "ok"}')
+
+        assert job_key2 in job_data_dict
+        assert os.path.isfile(backup_json2)
+
+        # Delete the running job
+        req(app, client, view='jobs.xhr', kws=dict(node=1, action='delete', id=jobs_id2),
+            jskws=dict(status=cst.OK))
+
+        # Monitor state must be cleaned
+        assert job_key2 not in job_data_dict, \
+            "job_data_dict should be cleaned after deleting running job"
+        # Backup stats file must be preserved (running job may be recovered
+        # by db_insert_jobs, and the file is the fallback when the logfile
+        # is temporarily unavailable)
+        assert os.path.isfile(backup_json2), \
+            "backup stats file should be preserved after deleting running job"
+
+        # --- Scenario 3: deleting a non-existent job is a safe no-op ---
+        req(app, client, view='jobs.xhr', kws=dict(node=1, action='delete', id=cst.BIGINT),
+            jskws=dict(status=cst.ERROR))
+
+        # Cleanup: stop the second job to avoid affecting later tests
+        client.get(url_for('api', node=1, opt='forcestop', project=cst.PROJECT,
+                           version_spider_job=jobid2))
 
 
 def test_log_not_exist(app, client):

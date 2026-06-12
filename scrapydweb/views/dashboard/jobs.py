@@ -11,6 +11,7 @@ from ...common import handle_metadata
 from ...models import create_jobs_table, db
 from ...vars import STRICT_NAME_PATTERN, jobs_table_map
 from ..baseview import BaseView
+from ..files.log import clean_job_caches
 
 
 _metadata = handle_metadata()
@@ -466,6 +467,17 @@ class JobsXhrView(BaseView):
             else:
                 self.js['status'] = self.OK
                 self.logger.info(self.js.setdefault('tip', "Deleted %s" % job))
+                # Clean in-memory caches and backup stats file so that the
+                # report page and stats page no longer serve stale results
+                # for the deleted job.  For running/pending jobs, only the
+                # monitor state is cleared; the backup stats file is kept as
+                # a fallback in case the logfile is temporarily unavailable
+                # and db_insert_jobs() may recover the record.
+                clean_job_caches(
+                    self.node, self.SCRAPYD_SERVER,
+                    job.project, job.spider, job.job,
+                    finished=(job.status == STATUS_FINISHED)
+                )
         else:
             self.js['status'] = self.ERROR
             self.js['message'] = "job #%s not found in the database" % self.id

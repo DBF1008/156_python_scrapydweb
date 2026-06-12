@@ -13,7 +13,7 @@ import time
 from flask import flash, get_flashed_messages, render_template, request, url_for
 from logparser import parse
 
-from ...vars import ROOT_DIR
+from ...vars import LEGAL_NAME_PATTERN, ROOT_DIR, STATS_PATH
 from ..baseview import BaseView
 
 
@@ -35,6 +35,46 @@ job_finished_key_dict = defaultdict(OrderedDict)
 job_finished_report_dict = defaultdict(OrderedDict)
 REPORT_KEYS_SET = {'from_memory', 'status', 'pages', 'items', 'shutdown_reason', 'finish_reason', 'runtime',
                    'first_log_time', 'latest_log_time', 'log_categories', 'latest_matches'}
+
+
+def clean_job_caches(node, scrapyd_server, project, spider, job, finished=True):
+    """Clean in-memory caches and backup stats file for a deleted job.
+
+    Called from JobsXhrView when a job is soft-deleted from the database view.
+    Without this cleanup, the report page (cluster reports) and stats page can
+    continue to serve stale results from the previously-viewed run.
+
+    For finished jobs: clears job_data_dict, job_finished_key_dict,
+    job_finished_report_dict, and removes the backup stats file on disk.
+
+    For running/pending jobs: only clears job_data_dict to preserve the
+    recovery semantics (db_insert_jobs can undelete the job) and the local
+    backup stats fallback (in case the logfile becomes temporarily unavailable).
+    """
+    job_key = '/%s/%s/%s/%s' % (node, project, spider, job)
+
+    # Always clean monitor/alert state; safe because poll will re-create it
+    # if the job is still running on Scrapyd.
+    job_data_dict.pop(job_key, None)
+
+    if finished:
+        # Clean finished-job tracking (refresh button on Log/Stats pages)
+        job_finished_key_dict[node].pop(job_key, None)
+        # Clean cached report stats (read_stats_for_report for cluster reports)
+        job_finished_report_dict[node].pop(job_key, None)
+
+        # Delete backup stats file on disk.  The path mirrors the layout used
+        # by LogView.mkdir_spider_path() and LogView.backup_stats():
+        #   STATS_PATH/<sanitised-server>/<project>/<spider>/<job>.json
+        node_path = os.path.join(
+            STATS_PATH,
+            re.sub(LEGAL_NAME_PATTERN, '-', re.sub(r'[.:]', '_', scrapyd_server))
+        )
+        backup_path = os.path.join(node_path, project, spider, job + '.json')
+        try:
+            os.remove(backup_path)
+        except OSError:
+            pass
 
 
 # http://flask.pocoo.org/docs/1.0/api/#flask.views.View
@@ -301,7 +341,6 @@ class LogView(BaseView):
         return spider_path
 
     def backup_stats(self):
-        # TODO: delete backup stats json file when the job is deleted in the Jobs page with database view
         try:
             with io.open(self.backup_stats_path, 'w', encoding='utf-8', errors='ignore') as f:
                 f.write(self.json_dumps(self.stats))
