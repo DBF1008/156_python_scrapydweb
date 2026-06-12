@@ -11,6 +11,7 @@ from ...common import handle_metadata
 from ...models import create_jobs_table, db
 from ...vars import STRICT_NAME_PATTERN, jobs_table_map
 from ..baseview import BaseView
+from ..files.log import LogView, delete_stats_caches
 
 
 _metadata = handle_metadata()
@@ -466,8 +467,23 @@ class JobsXhrView(BaseView):
             else:
                 self.js['status'] = self.OK
                 self.logger.info(self.js.setdefault('tip', "Deleted %s" % job))
+                # A finished job that has been opened once leaves cached results behind: the
+                # Reports-page cache (job_finished_report_dict) and the backup stats json file
+                # used as the Stats-page fallback. Purge both so neither keeps serving stale
+                # results for this run after it is deleted. Running/pending jobs are left
+                # untouched to preserve their recovery semantics (JobsView.db_insert_jobs) and
+                # the backup-stats fallback for live jobs.
+                if job.status == STATUS_FINISHED:
+                    self.purge_stats_caches(job)
         else:
             self.js['status'] = self.ERROR
             self.js['message'] = "job #%s not found in the database" % self.id
 
         return self.json_dumps(self.js, as_response=True)
+
+    def purge_stats_caches(self, job):
+        backup_stats_path = LogView.get_backup_stats_path(
+            self.STATS_PATH, self.SCRAPYD_SERVER, self.LEGAL_NAME_PATTERN,
+            job.project, job.spider, job.job)
+        delete_stats_caches(self.node, job.project, job.spider, job.job,
+                            backup_stats_path=backup_stats_path, logger=self.logger)

@@ -37,6 +37,46 @@ REPORT_KEYS_SET = {'from_memory', 'status', 'pages', 'items', 'shutdown_reason',
                    'first_log_time', 'latest_log_time', 'log_categories', 'latest_matches'}
 
 
+def delete_stats_caches(node, project, spider, job, backup_stats_path=None, logger=None):
+    """Purge the cached results a finished job leaves behind once it is deleted.
+
+    Opening the Stats or Report page of a finished job caches its parsed result in two
+    places: the in-memory ``job_finished_report_dict`` (served by the Reports page via
+    ``LogView.read_stats_for_report``) and, when ``BACKUP_STATS_JSON_FILE`` is enabled, an
+    on-disk backup json file (served as a fallback by the Stats page through
+    ``LogView.load_backup_stats`` when the scrapy logfile is missing). Deleting the job from
+    the Jobs page (database view) used to leave both behind, so the Reports page and the
+    stats fallback could keep returning stale results for that run -- which is easy to
+    mistake for a fresh job once there are many nodes.
+
+    Invoked from ``JobsXhrView`` for finished jobs only (see views/dashboard/jobs.py).
+    Running/pending jobs are left untouched so that their database-driven recovery semantics
+    (``JobsView.db_insert_jobs``) and the backup-stats fallback for live jobs are preserved.
+    Both caches are rebuilt the next time the Stats/Report page is opened, so purging a
+    finished job here is always safe.
+
+    Returns a ``(report_cache_removed, backup_file_removed)`` tuple.
+    """
+    job_key = '/%s/%s/%s/%s' % (node, project, spider, job)
+    # Use .get() so an unknown node is not materialized as an empty entry by the defaultdict.
+    node_reports = job_finished_report_dict.get(node)
+    report_cache_removed = bool(node_reports) and node_reports.pop(job_key, None) is not None
+
+    backup_file_removed = False
+    if backup_stats_path and os.path.isfile(backup_stats_path):
+        try:
+            os.remove(backup_stats_path)
+            backup_file_removed = True
+        except OSError as err:
+            if logger is not None:
+                logger.error("Fail to delete backup stats %s: %s", backup_stats_path, err)
+
+    if logger is not None and (report_cache_removed or backup_file_removed):
+        logger.info("Purged cached results for deleted job %s (report_cache=%s, backup_file=%s)",
+                    job_key, report_cache_removed, backup_file_removed)
+    return report_cache_removed, backup_file_removed
+
+
 # http://flask.pocoo.org/docs/1.0/api/#flask.views.View
 # http://flask.pocoo.org/docs/1.0/views/
 class LogView(BaseView):
@@ -284,9 +324,20 @@ class LogView(BaseView):
             self.logparser_valid = True
             self.stats['from_memory'] = True
 
+    @staticmethod
+    def get_node_dir(scrapyd_server, legal_name_pattern):
+        # Mirror the per-node directory naming, e.g. '127.0.0.1:6800' -> '127_0_0_1_6800'.
+        return re.sub(legal_name_pattern, '-', re.sub(r'[.:]', '_', scrapyd_server))
+
+    @staticmethod
+    def get_backup_stats_path(stats_path, scrapyd_server, legal_name_pattern, project, spider, job):
+        # The backup stats json file written by backup_stats() for a (node, project, spider, job).
+        # Reused by JobsXhrView to locate and delete the file when a finished job is deleted.
+        return os.path.join(stats_path, LogView.get_node_dir(scrapyd_server, legal_name_pattern),
+                            project, spider, job + '.json')
+
     def mkdir_spider_path(self):
-        node_path = os.path.join(self.STATS_PATH,
-                                 re.sub(self.LEGAL_NAME_PATTERN, '-', re.sub(r'[.:]', '_', self.SCRAPYD_SERVER)))
+        node_path = os.path.join(self.STATS_PATH, self.get_node_dir(self.SCRAPYD_SERVER, self.LEGAL_NAME_PATTERN))
         project_path = os.path.join(node_path, self.project)
         spider_path = os.path.join(project_path, self.spider)
 
@@ -301,7 +352,8 @@ class LogView(BaseView):
         return spider_path
 
     def backup_stats(self):
-        # TODO: delete backup stats json file when the job is deleted in the Jobs page with database view
+        # The backup file is removed by delete_stats_caches() (called from JobsXhrView in
+        # views/dashboard/jobs.py) when the finished job is deleted in the Jobs database view.
         try:
             with io.open(self.backup_stats_path, 'w', encoding='utf-8', errors='ignore') as f:
                 f.write(self.json_dumps(self.stats))
