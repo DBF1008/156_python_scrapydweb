@@ -15,13 +15,14 @@ def test_deploy_from_post(app, client):
 
 def test_auto_packaging_select_option(app, client):
     ins = [
-        '(14 projects)',
+        '(15 projects)',
         u"var folders = ['demo - 副本', 'demo',",
         "var projects = ['demo-copy', 'demo',",
         '<div>%s<' % cst.PROJECT,
         u'<div>demo - 副本<',
         '<div>demo<',
-        '<div>demo_only_scrapy_cfg<'
+        '<div>demo_only_scrapy_cfg<',
+        'one_project_inside'
     ]
     nos = ['<div>demo_without_scrapy_cfg<']
     if not os.environ.get('DATA_PATH', ''):
@@ -158,3 +159,51 @@ def test_deploy_xhr(app, client):
         version=cst.VERSION
     )
     req(app, client, view='deploy.xhr', kws=kws, jskws=dict(status=cst.OK, project=cst.PROJECT))
+
+
+# ---- New tests for enhanced deployment pipeline ----
+
+def test_discover_endpoint(app, client):
+    """POST /deploy/discover/ returns candidates JSON."""
+    import json
+    from flask import url_for
+
+    with app.test_request_context():
+        url = url_for('deploy.discover', node=1)
+        # Test with folder
+        response = client.post(url, content_type='multipart/form-data',
+                               data={'folder': cst.PROJECT})
+        js = json.loads(response.get_data(as_text=True))
+        assert js['status'] == 'ok'
+        assert 'candidates' in js
+        assert len(js['candidates']) >= 1
+        assert js['candidates'][0]['project_name'] == cst.PROJECT
+
+
+def test_discover_with_archive(app, client):
+    """POST /deploy/discover/ with archive file returns candidates."""
+    import json
+    from flask import url_for
+
+    with app.test_request_context():
+        url = url_for('deploy.discover', node=1)
+        data = {'file': (os.path.join(cst.ROOT_DIR, 'data/demo_outer.zip'), 'demo_outer.zip')}
+        response = client.post(url, content_type='multipart/form-data', data=data)
+        js = json.loads(response.get_data(as_text=True))
+        assert js['status'] == 'ok'
+        assert 'candidates' in js
+
+
+def test_discover_with_egg(app, client):
+    """POST /deploy/discover/ with egg file returns empty candidates with message."""
+    import json
+    from flask import url_for
+
+    with app.test_request_context():
+        url = url_for('deploy.discover', node=1)
+        data = {'file': (os.path.join(cst.ROOT_DIR, 'data/demo.egg'), 'demo.egg')}
+        response = client.post(url, content_type='multipart/form-data', data=data)
+        js = json.loads(response.get_data(as_text=True))
+        assert js['status'] == 'ok'
+        assert js['candidates'] == []
+        assert 'message' in js

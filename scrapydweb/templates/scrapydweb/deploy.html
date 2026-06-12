@@ -193,6 +193,17 @@
         <div id="filesize" class="key" style="padding-left: 12px; width: unset;"></div>
       </div>
 
+      <div class="line-container" id="candidate_selector" style="display:none;">
+        <div class="key">scrapy.cfg</div>
+        <div>
+          <select id="scrapy_cfg_select" class="value" style="padding: 0 10px; height: 40px; cursor: pointer;">
+          </select>
+          <div class="form-item-tip" style="color: #e6a23c; font-size: 12px; padding-top: 4px;">
+            Multiple scrapy.cfg files found. Please select one to deploy.
+          </div>
+        </div>
+      </div>
+
       <div class="line-container">
         <div class="key"><span>*</span>project</div>
         <div>
@@ -444,6 +455,8 @@ function resetUploadInputs() {
   my$('#version').value = '';
   my$('#project').readOnly = true;
   my$('#project').classList.add('readonly');
+  my$('#candidate_selector').style.display = 'none';
+  my$('#scrapy_cfg_select').innerHTML = '';
   checkUploadInputs();
 }
 
@@ -473,6 +486,48 @@ my$('#file').onchange = function() {
   var d = new Date(eggfile.lastModified);
   d.setMinutes(d.getMinutes()-d.getTimezoneOffset());
   my$('#version').value = d.toISOString().slice(0,19).replace(/:/g, "_");
+
+  // Hide candidate selector by default
+  my$('#candidate_selector').style.display = 'none';
+  my$('#scrapy_cfg_select').innerHTML = '';
+
+  // For compressed files, discover candidates via AJAX
+  if (filetype !== 'egg' && eggfile.name.indexOf('.tar.gz') !== -1 || filetype === 'zip') {
+    var formData = new FormData();
+    formData.append('file', eggfile);
+    fetch('{{ url_deploy_discover }}', {
+      method: 'POST',
+      body: formData
+    })
+    .then(function(response) { return response.json(); })
+    .then(function(data) {
+      if (data.status === 'ok' && data.candidates && data.candidates.length > 1) {
+        // Show candidate selector
+        var select = my$('#scrapy_cfg_select');
+        select.innerHTML = '';
+        data.candidates.forEach(function(c) {
+          var opt = document.createElement('option');
+          opt.value = c.relative_path;
+          opt.textContent = c.relative_path + ' (project: ' + c.project_name + ')';
+          select.appendChild(opt);
+        });
+        my$('#candidate_selector').style.display = 'flex';
+        // Auto-fill project from first candidate
+        if (data.candidates[0].project_name) {
+          my$('#project').value = data.candidates[0].project_name;
+        }
+      } else if (data.status === 'ok' && data.candidates && data.candidates.length === 1) {
+        // Single candidate: auto-fill project name
+        if (data.candidates[0].project_name) {
+          my$('#project').value = data.candidates[0].project_name;
+        }
+      }
+    })
+    .catch(function(err) {
+      console.log('Discover failed:', err);
+    });
+  }
+
   checkUploadInputs();
 };
 
@@ -521,6 +576,17 @@ function upload() {
   input.name = 'version';
   input.value = version;
   form.appendChild(input);
+
+  // Pass selected scrapy_cfg candidate if applicable
+  var scrapy_cfg_select = my$('#scrapy_cfg_select');
+  if (scrapy_cfg_select && scrapy_cfg_select.value &&
+      my$('#candidate_selector').style.display !== 'none') {
+    var input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = 'scrapy_cfg';
+    input.value = scrapy_cfg_select.value;
+    form.appendChild(input);
+  }
 
   my$('form').submit();
   showLoader();

@@ -12,13 +12,14 @@ from tests.utils import cst, req_single_scrapyd, set_single_scrapyd, upload_file
 
 def test_auto_packaging_select_option(app, client):
     ins = [
-        '(14 projects)',
+        '(15 projects)',
         u"var folders = ['demo - 副本', 'demo',",
         "var projects = ['demo-copy', 'demo',",
         '<div>%s<' % cst.PROJECT,
         u'<div>demo - 副本<',
         '<div>demo<',
-        '<div>demo_only_scrapy_cfg<'
+        '<div>demo_only_scrapy_cfg<',
+        'one_project_inside'
     ]
     nos = ['<div>demo_without_scrapy_cfg<', '<h3>No projects found']
     req_single_scrapyd(app, client, view='deploy', kws=dict(node=1), ins=ins, nos=nos)
@@ -159,3 +160,113 @@ def test_upload_file_deploy(app, client):
         if filename == 'demo_only_scrapy_cfg' or not alert:
             alert = 'Fail to deploy project, got status'
         upload_file_deploy_singlenode(filename='%s.zip' % filename, project=filename, alert=alert, fail=True)
+
+
+# ---- New tests for enhanced deployment pipeline ----
+
+def test_discover_endpoint_local_folder(app, client):
+    """POST /deploy/discover/ with folder returns candidates JSON."""
+    set_single_scrapyd(app)
+    data = {'folder': cst.PROJECT}
+    req_single_scrapyd(app, client, view='deploy.discover', kws=dict(node=1), data=data,
+                       jskws=dict(status='ok'), jskeys=['candidates'])
+
+
+def test_discover_endpoint_uploaded_archive(app, client):
+    """POST /deploy/discover/ with file returns candidates from archive."""
+    set_single_scrapyd(app)
+    data = {'file': (os.path.join(cst.ROOT_DIR, 'data/demo_outer.zip'), 'demo_outer.zip')}
+    req_single_scrapyd(app, client, view='deploy.discover', kws=dict(node=1), data=data,
+                       jskws=dict(status='ok'), jskeys=['candidates'])
+
+
+def test_discover_endpoint_direct_egg(app, client):
+    """POST /deploy/discover/ with egg file returns empty candidates."""
+    set_single_scrapyd(app)
+    data = {'file': (os.path.join(cst.ROOT_DIR, 'data/demo.egg'), 'demo.egg')}
+    req_single_scrapyd(app, client, view='deploy.discover', kws=dict(node=1), data=data,
+                       jskws=dict(status='ok'), jskeys=['candidates', 'message'])
+
+
+def test_nested_project_in_deploy_page(app, client):
+    """one_project_inside is now visible in deploy page dropdown (recursive discovery)."""
+    set_single_scrapyd(app)
+    app.config['SCRAPY_PROJECTS_DIR'] = os.path.join(cst.ROOT_DIR, 'data')
+    req_single_scrapyd(app, client, view='deploy', kws=dict(node=1),
+                       ins='one_project_inside')
+
+
+def test_egg_not_in_source_dir(app, client):
+    """build_egg() no longer copies egg to source project directory."""
+    import glob as glob_mod
+    from scrapydweb.vars import DEPLOY_PATH
+
+    data = {
+        'folder': cst.PROJECT,
+        'project': cst.PROJECT,
+        'version': cst.VERSION,
+    }
+    with app.test_request_context():
+        req_single_scrapyd(app, client, view='deploy.upload', kws=dict(node=1), data=data,
+                           location=url_for('schedule', node=1, project=cst.PROJECT, version=cst.VERSION))
+
+    # Egg should exist in DEPLOY_PATH
+    expected_egg = os.path.join(DEPLOY_PATH, '%s_%s.egg' % (cst.PROJECT, cst.VERSION))
+    assert os.path.exists(expected_egg), "Expected egg in DEPLOY_PATH: %s" % expected_egg
+
+    # Egg should NOT exist in source project directory
+    project_path = os.path.join(cst.ROOT_DIR, 'data', cst.PROJECT)
+    eggs_in_source = glob_mod.glob(os.path.join(project_path, '*.egg'))
+    assert len(eggs_in_source) == 0, "Egg should not be in source dir: %s" % eggs_in_source
+
+
+def test_egg_naming_compressed_upload(app, client):
+    """Compressed upload produces consistent {project}_{version}.egg naming."""
+    import glob as glob_mod
+    from scrapydweb.vars import DEPLOY_PATH
+
+    set_single_scrapyd(app)
+    data = {
+        'project': cst.PROJECT,
+        'version': cst.VERSION,
+        'file': (os.path.join(cst.ROOT_DIR, 'data/demo_outer.zip'), 'demo_outer.zip')
+    }
+    with app.test_request_context():
+        url = url_for('deploy.upload', node=1)
+        response = client.post(url, content_type='multipart/form-data', data=data)
+        text = response.get_data(as_text=True)
+        # Should succeed (single candidate in demo_outer.zip)
+        assert response.status_code == 302 or 'deploy results' in text or 'schedule' in text.lower()
+
+    # Egg should follow consistent naming pattern
+    expected_egg = os.path.join(DEPLOY_PATH, '%s_%s.egg' % (cst.PROJECT, cst.VERSION))
+    assert os.path.exists(expected_egg), "Expected egg: %s" % expected_egg
+
+
+def test_explicit_scrapy_cfg_selection(app, client):
+    """Deploy with explicit scrapy_cfg form field uses specified config."""
+    set_single_scrapyd(app)
+    # demo_outer.zip has scrapy.cfg inside a nested directory
+    data = {
+        'project': cst.PROJECT,
+        'version': cst.VERSION,
+        'file': (os.path.join(cst.ROOT_DIR, 'data/demo_outer.zip'), 'demo_outer.zip'),
+    }
+    # First, discover candidates to find a valid relative path
+    with app.test_request_context():
+        url_discover = url_for('deploy.discover', node=1)
+        response = client.post(url_discover, content_type='multipart/form-data', data=data)
+        import json
+        js = json.loads(response.get_data(as_text=True))
+        assert js['status'] == 'ok'
+        assert len(js['candidates']) >= 1
+
+    # Now deploy with explicit scrapy_cfg selection
+    if js['candidates']:
+        selected_path = js['candidates'][0]['relative_path']
+        data['scrapy_cfg'] = selected_path
+        with app.test_request_context():
+            url = url_for('deploy.upload', node=1)
+            response = client.post(url, content_type='multipart/form-data', data=data)
+            text = response.get_data(as_text=True)
+            assert response.status_code == 302 or 'deploy results' in text

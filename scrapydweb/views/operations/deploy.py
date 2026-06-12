@@ -19,6 +19,12 @@ from werkzeug.utils import secure_filename
 
 from ...vars import PY2
 from ..baseview import BaseView
+from .candidate import (
+    AmbiguousCandidateError,
+    discover_scrapy_cfg_candidates,
+    generate_egg_filename,
+    select_candidate,
+)
 from .scrapyd_deploy import _build_egg, get_config
 from .utils import mkdir_p, slot
 
@@ -33,6 +39,45 @@ project = projectname
 
 """
 folder_project_dict = {}
+
+
+def uncompress_to_tmpdir(filepath, _logger=None):
+    """
+    Extract a compressed archive (zip or tar.gz) to a temporary directory.
+
+    Handles Python 2 GBK-encoded filenames from Windows CN.
+    Returns the path to the temp directory.
+    """
+    if _logger:
+        _logger.debug("Uncompressing %s", filepath)
+    tmpdir = tempfile.mkdtemp(prefix="scrapydweb-uncompress-")
+    if zipfile.is_zipfile(filepath):
+        with zipfile.ZipFile(filepath, 'r') as f:
+            if PY2:
+                tmpdir = tempfile.mkdtemp(prefix="scrapydweb-uncompress-")
+                for filename in f.namelist():
+                    try:
+                        filename_utf8 = filename.decode('gbk').encode('utf8')
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        filename_utf8 = filename
+                    filepath_utf8 = os.path.join(tmpdir, filename_utf8)
+
+                    try:
+                        with io.open(filepath_utf8, 'wb') as f_utf8:
+                            copyfileobj(f.open(filename), f_utf8)
+                    except IOError:
+                        # zipfile from Windows "send to zipped" would meet the inner folder first:
+                        # temp\\scrapydweb-uncompress-qrcyc0\\demo7/demo/'
+                        mkdir_p(filepath_utf8)
+            else:
+                f.extractall(tmpdir)
+    else:  # tar.gz
+        with tarfile.open(filepath, 'r') as tar:
+            tar.extractall(tmpdir)
+
+    if _logger:
+        _logger.debug("Uncompressed to %s", tmpdir)
+    return tmpdir.decode('utf8') if PY2 else tmpdir
 
 
 class DeployView(BaseView):
@@ -53,7 +98,7 @@ class DeployView(BaseView):
     def dispatch_request(self, **kwargs):
         self.set_scrapy_cfg_list()
         self.project_paths = [os.path.dirname(i) for i in self.scrapy_cfg_list]
-        self.folders = [os.path.basename(i) for i in self.project_paths]
+        self.folders = [os.path.relpath(i, self.SCRAPY_PROJECTS_DIR) for i in self.project_paths]
         self.get_modification_times()
         self.parse_scrapy_cfg()
 
@@ -68,27 +113,24 @@ class DeployView(BaseView):
             latest_folder=self.latest_folder,
             SCRAPY_PROJECTS_DIR=self.SCRAPY_PROJECTS_DIR.replace('\\', '/'),
             url_servers=url_for('servers', node=self.node, opt='deploy'),
-            url_deploy_upload=url_for('deploy.upload', node=self.node)
+            url_deploy_upload=url_for('deploy.upload', node=self.node),
+            url_deploy_discover=url_for('deploy.discover', node=self.node)
         )
         return render_template(self.template, **kwargs)
 
     def set_scrapy_cfg_list(self):
-        # Python 'ascii' codec can't decode byte
-        try:
-            self.scrapy_cfg_list = glob.glob(os.path.join(self.SCRAPY_PROJECTS_DIR, '*', u'scrapy.cfg'))
-        except UnicodeDecodeError:
-            if PY2:
-                for name in os.listdir(os.path.join(self.SCRAPY_PROJECTS_DIR, u'')):
-                    if not isinstance(name, text_type):
-                        msg = "Ignore non-unicode filename %s in %s" % (repr(name), self.SCRAPY_PROJECTS_DIR)
-                        self.logger.error(msg)
-                        flash(msg, self.WARN)
-                    else:
-                        scrapy_cfg = os.path.join(self.SCRAPY_PROJECTS_DIR, name, u'scrapy.cfg')
-                        if os.path.exists(scrapy_cfg):
-                            self.scrapy_cfg_list.append(scrapy_cfg)
-            else:
-                raise
+        # Recursive discovery of ALL scrapy.cfg files under SCRAPY_PROJECTS_DIR
+        candidates = discover_scrapy_cfg_candidates(self.SCRAPY_PROJECTS_DIR)
+
+        # Filter out candidates directly in SCRAPY_PROJECTS_DIR root (not in a subdirectory).
+        # These are not standalone projects — they would resolve to folder='.' which is
+        # not a valid project folder for the deploy dropdown.
+        abs_root = os.path.abspath(self.SCRAPY_PROJECTS_DIR)
+        self.scrapy_cfg_list = [
+            c['scrapy_cfg_path'] for c in candidates
+            if os.path.abspath(os.path.dirname(c['scrapy_cfg_path'])) != abs_root
+        ]
+
         # '/home/username/Downloads/scrapydweb/scrapydweb/data/demo_projects/\udc8b\udc8billegal/scrapy.cfg'
         # UnicodeEncodeError: 'utf-8' codec can't encode characters in position 64-65: surrogates not allowed
         new_scrapy_cfg_list = []
@@ -195,6 +237,7 @@ class DeployUploadView(BaseView):
         self.eggpath = ''
         self.scrapy_cfg_path = ''
         self.scrapy_cfg_searched_paths = []
+        self.scrapy_cfg_candidates = []
         self.scrapy_cfg_not_found = False
         self.scrapy_cfg_parse_error = ''
         self.build_egg_subprocess_error = ''
@@ -213,8 +256,25 @@ class DeployUploadView(BaseView):
                 alert = "Fail to deploy project:"
 
             if self.scrapy_cfg_not_found:
-                text = "scrapy.cfg not found"
-                tip = "Make sure that the 'scrapy.cfg' file resides in your project directory. "
+                if self.scrapy_cfg_candidates:
+                    # Ambiguous: multiple candidates found but none selected
+                    text = "Multiple scrapy.cfg files found (%d candidates)" % len(
+                        self.scrapy_cfg_candidates)
+                    tip = ("Please specify which 'scrapy.cfg' to use by passing the "
+                           "'scrapy_cfg' form field with one of the relative paths below. ")
+                    candidate_lines = [
+                        '  - %s (project: %s)' % (c['relative_path'], c['project_name'])
+                        for c in self.scrapy_cfg_candidates
+                    ]
+                    message = "Candidates:\n%s" % '\n'.join(candidate_lines)
+                else:
+                    # No candidates at all
+                    text = "scrapy.cfg not found"
+                    tip = "Make sure that the 'scrapy.cfg' file resides in your project directory. "
+                    # Handle case when scrapy.cfg not found in zip file which contains
+                    # illegal pathnames in PY3
+                    message = "scrapy_cfg_searched_paths:\n%s" % pformat(
+                        self.scrapy_cfg_searched_paths)
             elif self.scrapy_cfg_parse_error:
                 text = self.scrapy_cfg_parse_error
                 tip = "Check the content of the 'scrapy.cfg' file in your project directory. "
@@ -223,10 +283,7 @@ class DeployUploadView(BaseView):
                 tip = ("Check the content of the 'scrapy.cfg' file in your project directory. "
                        "Or build the egg file by yourself instead. ")
 
-            if self.scrapy_cfg_not_found:
-                # Handle case when scrapy.cfg not found in zip file which contains illegal pathnames in PY3
-                message = "scrapy_cfg_searched_paths:\n%s" % pformat(self.scrapy_cfg_searched_paths)
-            else:
+            if not self.scrapy_cfg_not_found:
                 message = "# The 'scrapy.cfg' file in your project directory should be like:\n%s" % SCRAPY_CFG
 
             return render_template(self.template_fail, node=self.node,
@@ -304,12 +361,13 @@ class DeployUploadView(BaseView):
         # Use folder instead of project
         project_path = os.path.join(self.SCRAPY_PROJECTS_DIR, self.folder)
 
-        self.search_scrapy_cfg_path(project_path)
+        selected_scrapy_cfg = request.form.get('scrapy_cfg', '') or None
+        self.search_scrapy_cfg_path(project_path, selected_scrapy_cfg=selected_scrapy_cfg)
         if not self.scrapy_cfg_path:
             self.scrapy_cfg_not_found = True
             return
 
-        self.eggname = '%s_%s.egg' % (self.project, self.version)
+        self.eggname = generate_egg_filename(self.project, self.version)
         self.eggpath = os.path.join(self.DEPLOY_PATH, self.eggname)
         self.build_egg()
 
@@ -337,12 +395,13 @@ class DeployUploadView(BaseView):
             tmpdir = self.uncompress_to_tmpdir(filepath)
 
             # Search from the root of tmpdir
-            self.search_scrapy_cfg_path(tmpdir)
+            selected_scrapy_cfg = request.form.get('scrapy_cfg', '') or None
+            self.search_scrapy_cfg_path(tmpdir, selected_scrapy_cfg=selected_scrapy_cfg)
             if not self.scrapy_cfg_path:
                 self.scrapy_cfg_not_found = True
                 return
 
-            self.eggname = re.sub(r'(\.zip|\.tar\.gz)$', '.egg', filename)
+            self.eggname = generate_egg_filename(self.project, self.version)
             self.eggpath = os.path.join(self.DEPLOY_PATH, self.eggname)
             self.build_egg()
 
@@ -353,59 +412,74 @@ class DeployUploadView(BaseView):
     # macOS + PY2 would raise OSError: Illegal byte sequence
     # Ubuntu + PY2 would raise UnicodeDecodeError in search_scrapy_cfg_path() though f.extractall(tmpdir) works well
     def uncompress_to_tmpdir(self, filepath):
-        self.logger.debug("Uncompressing %s", filepath)
-        tmpdir = tempfile.mkdtemp(prefix="scrapydweb-uncompress-")
-        if zipfile.is_zipfile(filepath):
-            with zipfile.ZipFile(filepath, 'r') as f:
-                if PY2:
-                    tmpdir = tempfile.mkdtemp(prefix="scrapydweb-uncompress-")
-                    for filename in f.namelist():
-                        try:
-                            filename_utf8 = filename.decode('gbk').encode('utf8')
-                        except (UnicodeDecodeError, UnicodeEncodeError):
-                            filename_utf8 = filename
-                        filepath_utf8 = os.path.join(tmpdir, filename_utf8)
+        return uncompress_to_tmpdir(filepath, _logger=self.logger)
 
-                        try:
-                            with io.open(filepath_utf8, 'wb') as f_utf8:
-                                copyfileobj(f.open(filename), f_utf8)
-                        except IOError:
-                            # os.mkdir(filepath_utf8)
-                            # zipfile from Windows "send to zipped" would meet the inner folder first:
-                            # temp\\scrapydweb-uncompress-qrcyc0\\demo7/demo/'
-                            mkdir_p(filepath_utf8)
-                else:
-                    f.extractall(tmpdir)
-        else:  # tar.gz
-            with tarfile.open(filepath, 'r') as tar:  # Open for reading with transparent compression (recommended).
-                tar.extractall(tmpdir)
+    def search_scrapy_cfg_path(self, search_path, selected_scrapy_cfg=None,
+                                func_walk=os.walk, retry=True):
+        """
+        Discover all scrapy.cfg candidates in search_path and select one.
 
-        self.logger.debug("Uncompressed to %s", tmpdir)
-        # In case uploading a compressed file in which scrapy_cfg_dir contains none ascii in python 2,
-        # whereas selecting a project for auto packaging, scrapy_cfg_dir is unicode
-        # print(repr(tmpdir))
-        # print(type(tmpdir))
-        return tmpdir.decode('utf8') if PY2 else tmpdir
+        If selected_scrapy_cfg is provided, match by absolute or relative path.
+        If exactly 1 candidate exists and no selection, auto-select (backward compat).
+        If multiple candidates exist without explicit selection, raise AmbiguousCandidateError.
 
-    def search_scrapy_cfg_path(self, search_path, func_walk=os.walk, retry=True):
+        Sets self.scrapy_cfg_path on success, self.scrapy_cfg_not_found on failure.
+        Stores all candidates in self.scrapy_cfg_candidates for error reporting.
+        """
         try:
-            for dirpath, dirnames, filenames in func_walk(search_path):
-                self.scrapy_cfg_searched_paths.append(os.path.abspath(dirpath))
-                self.scrapy_cfg_path = os.path.abspath(os.path.join(dirpath, 'scrapy.cfg'))
-                if os.path.exists(self.scrapy_cfg_path):
-                    self.logger.debug("scrapy_cfg_path: %s", self.scrapy_cfg_path)
-                    return
+            candidates = discover_scrapy_cfg_candidates(search_path)
         except UnicodeDecodeError:
             msg = "Found illegal filenames in %s" % search_path
             self.logger.error(msg)
             flash(msg, self.WARN)
             if PY2 and retry:
-                self.search_scrapy_cfg_path(search_path, func_walk=self.safe_walk, retry=False)
+                # Fallback: manual walk filtering non-unicode
+                candidates = []
+                try:
+                    for dirpath, dirnames, filenames in self.safe_walk(search_path):
+                        if 'scrapy.cfg' in filenames:
+                            cfg_path = os.path.abspath(os.path.join(dirpath, 'scrapy.cfg'))
+                            candidates.append({
+                                'scrapy_cfg_path': cfg_path,
+                                'project_name': os.path.basename(dirpath),
+                                'settings_module': '',
+                                'relative_path': os.path.relpath(cfg_path, search_path),
+                            })
+                except Exception:
+                    candidates = []
             else:
                 raise
-        else:
+
+        self.scrapy_cfg_candidates = candidates
+        self.scrapy_cfg_searched_paths = [
+            os.path.dirname(c['scrapy_cfg_path']) for c in candidates
+        ]
+
+        if not candidates:
             self.logger.error("scrapy.cfg not found in: %s", search_path)
             self.scrapy_cfg_path = ''
+            return
+
+        try:
+            selected = select_candidate(candidates, selected_path=selected_scrapy_cfg)
+        except AmbiguousCandidateError as err:
+            self.logger.warning("Ambiguous scrapy.cfg: %s", err)
+            self.scrapy_cfg_path = ''
+            self.scrapy_cfg_not_found = True
+            return
+
+        if selected is None:
+            if selected_scrapy_cfg:
+                self.logger.error(
+                    "Selected scrapy.cfg '%s' not found among candidates in %s",
+                    selected_scrapy_cfg, search_path
+                )
+            else:
+                self.logger.error("scrapy.cfg not found in: %s", search_path)
+            self.scrapy_cfg_path = ''
+        else:
+            self.scrapy_cfg_path = selected['scrapy_cfg_path']
+            self.logger.debug("scrapy_cfg_path: %s", self.scrapy_cfg_path)
 
     def build_egg(self):
         try:
@@ -419,8 +493,6 @@ class DeployUploadView(BaseView):
             self.build_egg_subprocess_error = err
             return
 
-        scrapy_cfg_dir = os.path.dirname(self.scrapy_cfg_path)
-        copyfile(egg, os.path.join(scrapy_cfg_dir, self.eggname))
         copyfile(egg, self.eggpath)
         rmtree(tmpdir)
         self.logger.debug("Egg file saved to: %s", self.eggpath)
@@ -465,3 +537,69 @@ class DeployXhrView(BaseView):
         }
         status_code, js = self.make_request(self.url, data=data, auth=self.AUTH)
         return self.json_dumps(js, as_response=True)
+
+
+class DeployDiscoverView(BaseView):
+    """
+    JSON API endpoint for discovering scrapy.cfg candidates in a project.
+
+    Accepts either:
+    - POST with 'folder' form field -> searches SCRAPY_PROJECTS_DIR/folder
+    - POST with 'file' upload -> uncompresses to tmpdir and searches
+
+    Returns JSON:
+    {
+        "status": "ok",
+        "candidates": [
+            {
+                "scrapy_cfg_path": "/abs/path/to/scrapy.cfg",
+                "project_name": "demo",
+                "settings_module": "demo.settings",
+                "relative_path": "demo/scrapy.cfg"
+            }
+        ]
+    }
+    """
+    methods = ['POST']
+
+    def __init__(self):
+        super(DeployDiscoverView, self).__init__()
+
+    def dispatch_request(self, **kwargs):
+        if request.files.get('file'):
+            file = request.files['file']
+            filename = secure_filename(file.filename)
+
+            if filename.endswith('egg'):
+                return self.json_dumps({
+                    'status': self.OK,
+                    'candidates': [],
+                    'message': 'Direct egg upload does not require scrapy.cfg discovery'
+                }, as_response=True)
+
+            filepath = os.path.join(self.DEPLOY_PATH, filename)
+            file.save(filepath)
+            try:
+                tmpdir = uncompress_to_tmpdir(filepath, _logger=self.logger)
+            except Exception as err:
+                self.logger.error("Failed to uncompress: %s", err)
+                return self.json_dumps({
+                    'status': self.ERROR,
+                    'message': 'Failed to uncompress: %s' % str(err)
+                }, as_response=True)
+            search_path = tmpdir
+
+        elif request.form.get('folder'):
+            folder = request.form['folder']
+            search_path = os.path.join(self.SCRAPY_PROJECTS_DIR, folder)
+        else:
+            return self.json_dumps({
+                'status': self.ERROR,
+                'message': 'Either "folder" or "file" must be provided'
+            }, as_response=True)
+
+        candidates = discover_scrapy_cfg_candidates(search_path)
+        return self.json_dumps({
+            'status': self.OK,
+            'candidates': candidates
+        }, as_response=True)
